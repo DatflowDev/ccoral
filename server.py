@@ -110,15 +110,22 @@ def strip_message_tags(body: dict, profile: dict) -> int:
 
 
 def rotate_logs(max_days: int = 14):
-    """Delete JSONL log files older than max_days."""
+    """Delete request-log and proxy-stdout log files older than max_days."""
     if not LOG_DIR.exists():
         return
     cutoff = datetime.now() - timedelta(days=max_days)
-    for logfile in LOG_DIR.glob("ccoral-*.jsonl"):
-        mtime = datetime.fromtimestamp(logfile.stat().st_mtime)
-        if mtime < cutoff:
-            log.info(f"Rotating old log: {logfile.name}")
-            logfile.unlink()
+    for pattern in ("ccoral-*.jsonl", "proxy-*.log"):
+        for logfile in LOG_DIR.glob(pattern):
+            try:
+                mtime = datetime.fromtimestamp(logfile.stat().st_mtime)
+            except FileNotFoundError:
+                continue
+            if mtime < cutoff:
+                log.info(f"Rotating old log: {logfile.name}")
+                try:
+                    logfile.unlink()
+                except OSError as e:
+                    log.warning(f"Failed to rotate {logfile.name}: {e}")
 
 
 def log_request(entry: dict):
@@ -227,17 +234,45 @@ def modify_request_body(body: dict, profile: dict) -> dict:
 async def handle_messages(request: web.Request) -> web.StreamResponse:
     """Handle /v1/messages — the main Claude API endpoint."""
 
+    # Timing instrumentation — measures where latency is.
+    # t_req_recv:   CC → CCORAL body received
+    # t_upstream_connected:  CCORAL → Anthropic POST accepted (TTFB from API perspective)
+    # t_first_chunk: first SSE chunk arrived from Anthropic (model started emitting)
+    # t_last_chunk:  last SSE chunk written to CC (full response forwarded)
+    # Each big gap tells a different story: a big t_first_chunk gap means Anthropic
+    # took time to process the request; a big t_last_chunk means the model output
+    # itself was long. CCORAL overhead = (t_req_recv → t_upstream_connected) and
+    # between-chunk stalls on our side.
+    import time as _time
+    t_req_recv = _time.perf_counter()
+
     # Read request body
     raw_body = await request.read()
-    body = json.loads(raw_body)
 
-    # Debug: dump raw incoming body BEFORE any modification
-    raw_dump = Path.home() / ".ccoral" / "logs" / f"raw-{body.get('model','unknown')[:10]}.json"
-    try:
-        with open(raw_dump, "w") as f:
-            f.write(raw_body.decode("utf-8", errors="replace"))
-    except Exception:
-        pass
+    # CRITICAL: json.loads on ~1.5 MB bodies blocks the asyncio event loop for
+    # 100-300 ms. Under burst traffic from Claude Code (multiple rapid tool
+    # results), this causes Send-Q buildup and apparent hangs. Offload to the
+    # default executor (thread pool) so the event loop keeps servicing other
+    # incoming requests.
+    loop = asyncio.get_running_loop()
+    body = await loop.run_in_executor(None, json.loads, raw_body)
+
+    # Debug: dump raw incoming body BEFORE any modification.
+    # Previously this was a synchronous file write of up to 1.5 MB on the
+    # event loop, which could pause everything for tens to hundreds of ms on
+    # a contended disk. Run the whole write in the executor.
+    def _write_raw_dump() -> None:
+        raw_dump = Path.home() / ".ccoral" / "logs" / f"raw-{body.get('model','unknown')[:10]}.json"
+        try:
+            with open(raw_dump, "w") as f:
+                f.write(raw_body.decode("utf-8", errors="replace"))
+        except Exception:
+            pass
+    # Fire-and-forget: schedule but don't block the request on the dump.
+    # run_in_executor returns a Future which we discard — the work is already
+    # scheduled on the thread pool. Do NOT wrap in asyncio.create_task — that
+    # expects a coroutine and raises TypeError on a Future, returning a 500.
+    loop.run_in_executor(None, _write_raw_dump)
 
     # Load profile — env override takes precedence over global active
     if PROFILE_OVERRIDE:
@@ -373,15 +408,24 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
 
     is_streaming = body.get("stream", False)
 
-    # Use original raw bytes if unmodified, otherwise re-serialize preserving key order
-    outbound_body = raw_body if not modified else json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode("utf-8")
+    # Use original raw bytes if unmodified, otherwise re-serialize preserving
+    # key order. json.dumps on ~1.5 MB blocks the event loop ~200-500 ms —
+    # offload to thread pool for the same reason as json.loads above.
+    if not modified:
+        outbound_body = raw_body
+    else:
+        def _serialize() -> bytes:
+            return json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode("utf-8")
+        outbound_body = await loop.run_in_executor(None, _serialize)
 
     session = request.app["upstream_session"]
+    t_upstream_start = _time.perf_counter()
     async with session.post(
         target_url,
         data=outbound_body,
         headers=forward_headers,
     ) as upstream:
+        t_upstream_connected = _time.perf_counter()
 
         if is_streaming:
             # Stream SSE response back, optionally capturing text for room mode
@@ -403,21 +447,77 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             # Accumulate text blocks if we're capturing for room mode
             captured_text = [] if RESPONSE_FILE else None
 
+            # ONE-SHOT SSE DUMP: if a marker file exists, dump full SSE of next
+            # response to it, then delete the marker. Used for debugging stream
+            # format changes (e.g. 4.6 → 4.7 thinking delta format).
+            dump_marker = Path.home() / ".ccoral" / "logs" / "DUMP_NEXT_SSE"
+            dump_target = Path.home() / ".ccoral" / "logs" / "sse-dump.txt"
+            should_dump_full = dump_marker.exists()
+            full_sse: list[bytes] = [] if should_dump_full else None
+            if should_dump_full:
+                try:
+                    dump_marker.unlink()
+                except Exception:
+                    pass
+                log.info(f"ONE-SHOT SSE dump armed -> {dump_target}")
+
+            # Capture stop_reason + content_block_starts to detect "model stopped
+            # without tool_use" freezes. Keep a rolling tail of the raw SSE stream
+            # so if the user reports a freeze we can see exactly what came back.
+            sse_tail: list[bytes] = []
+            SSE_TAIL_MAX = 64 * 1024  # keep last 64KB of the stream
+            sse_tail_bytes = 0
+            block_starts: list[str] = []  # types of content_block_start
+            seen_stop_reason: str | None = None
+
+            t_first_chunk = None
+            bytes_streamed = 0
             async for chunk in upstream.content.iter_any():
+                if t_first_chunk is None:
+                    t_first_chunk = _time.perf_counter()
+                bytes_streamed += len(chunk)
                 await response.write(chunk)
 
-                # Extract text deltas from SSE for room capture
-                if captured_text is not None:
-                    try:
-                        chunk_str = chunk.decode("utf-8", errors="ignore")
-                        for line in chunk_str.split("\n"):
-                            if line.startswith("data: "):
-                                data = json.loads(line[6:])
-                                delta = data.get("delta", {})
-                                if delta.get("type") == "text_delta":
-                                    captured_text.append(delta.get("text", ""))
-                    except (json.JSONDecodeError, KeyError):
-                        pass
+                # Accumulate rolling tail of raw SSE for post-hoc inspection.
+                sse_tail.append(chunk)
+                sse_tail_bytes += len(chunk)
+                while sse_tail_bytes > SSE_TAIL_MAX and len(sse_tail) > 1:
+                    dropped = sse_tail.pop(0)
+                    sse_tail_bytes -= len(dropped)
+
+                # One-shot full dump capture
+                if full_sse is not None:
+                    full_sse.append(chunk)
+
+                # Cheap per-chunk inspection for block types + stop reasons.
+                # Decode tolerantly (SSE lines may split across chunks) — the
+                # "miss a block across a boundary" rate is acceptable because we
+                # also have the raw tail if we need it.
+                try:
+                    cs = chunk.decode("utf-8", errors="ignore")
+                    for line in cs.split("\n"):
+                        if not line.startswith("data: "):
+                            continue
+                        try:
+                            data = json.loads(line[6:])
+                        except (ValueError, json.JSONDecodeError):
+                            continue
+                        ev = data.get("type")
+                        if ev == "content_block_start":
+                            cb = (data.get("content_block") or {}).get("type")
+                            if cb:
+                                block_starts.append(cb)
+                        elif ev == "message_delta":
+                            sr = (data.get("delta") or {}).get("stop_reason")
+                            if sr:
+                                seen_stop_reason = sr
+                        # Room-capture text deltas (existing behavior)
+                        if captured_text is not None and ev == "content_block_delta":
+                            delta = data.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                captured_text.append(delta.get("text", ""))
+                except Exception:
+                    pass
 
             # Write captured response to file for room relay
             # Skip short responses (titles, summaries) and non-main-model calls
@@ -436,6 +536,73 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                         log.error(f"Room capture failed: {e}")
                 elif full_text:
                     log.debug(f"Room capture skipped: haiku={is_haiku} json={is_json} short={is_too_short} len={len(full_text)}")
+
+            t_last_chunk = _time.perf_counter()
+
+            # Write one-shot full SSE dump if armed
+            if full_sse is not None:
+                try:
+                    dump_target.write_bytes(b"".join(full_sse))
+                    log.info(f"ONE-SHOT SSE dump written: {dump_target} ({sum(len(c) for c in full_sse)} bytes)")
+                except Exception as e:
+                    log.error(f"SSE dump failed: {e}")
+
+            # Emit timing log. Only for "main conversation" calls (not haiku/utility).
+            if modified and not is_utility and not is_haiku:
+                ms_body_read = int((t_upstream_start - t_req_recv) * 1000)
+                ms_connect = int((t_upstream_connected - t_upstream_start) * 1000)
+                ms_ttfb = int(((t_first_chunk or t_upstream_connected) - t_upstream_connected) * 1000)
+                ms_stream = int((t_last_chunk - (t_first_chunk or t_upstream_connected)) * 1000)
+                ms_total = int((t_last_chunk - t_req_recv) * 1000)
+                log.info(
+                    f"timing total={ms_total}ms "
+                    f"prep={ms_body_read}ms connect={ms_connect}ms "
+                    f"ttfb={ms_ttfb}ms stream={ms_stream}ms "
+                    f"bytes_out={bytes_streamed} msgs={len(body.get('messages', []))}"
+                )
+                try:
+                    timing_log = Path.home() / ".ccoral" / "logs" / "timings.jsonl"
+                    with open(timing_log, "a") as tf:
+                        tf.write(json.dumps({
+                            "ts": datetime.now().isoformat(),
+                            "ms_total": ms_total,
+                            "ms_body_read": ms_body_read,
+                            "ms_connect": ms_connect,
+                            "ms_ttfb": ms_ttfb,
+                            "ms_stream": ms_stream,
+                            "bytes_out": bytes_streamed,
+                            "msgs": len(body.get("messages", [])),
+                            "status": upstream.status,
+                            "block_starts": block_starts,
+                            "stop_reason": seen_stop_reason,
+                            "has_tool_use": "tool_use" in block_starts,
+                        }) + "\n")
+                except Exception:
+                    pass
+
+                # Extra red-flag: model ended the turn with no tool_use.
+                # With Claude Code, end_turn + no tool_use means the model chose
+                # to stop talking without asking to run anything — which the user
+                # experiences as "froze". Log it prominently + dump the SSE tail
+                # so we can see what text/thinking came back.
+                if seen_stop_reason == "end_turn" and "tool_use" not in block_starts:
+                    try:
+                        freeze_dump = Path.home() / ".ccoral" / "logs" / "end-turn-no-tool.jsonl"
+                        tail_bytes = b"".join(sse_tail)
+                        with open(freeze_dump, "a") as ff:
+                            ff.write(json.dumps({
+                                "ts": datetime.now().isoformat(),
+                                "msgs": len(body.get("messages", [])),
+                                "block_starts": block_starts,
+                                "bytes_out": bytes_streamed,
+                                "tail_snippet": tail_bytes[-8000:].decode("utf-8", errors="replace"),
+                            }) + "\n")
+                        log.warning(
+                            f"end_turn without tool_use at msgs={len(body.get('messages', []))}; "
+                            f"blocks={block_starts}"
+                        )
+                    except Exception:
+                        pass
 
             await response.write_eof()
             return response
@@ -476,21 +643,77 @@ async def handle_passthrough(request: web.Request) -> web.StreamResponse:
 
 
 async def on_startup(app):
-    """Create a persistent HTTP session for upstream requests."""
+    """Create a persistent HTTP session for upstream requests.
+
+    Why force_close=True: Anthropic's server closes idle keepalive connections
+    before our keepalive_timeout (30s) fires, leaving the socket in CLOSE_WAIT
+    on our side. aiohttp's connection pool can then hand that poisoned socket
+    to a new request, which hangs forever — this is the "silent freeze"
+    failure mode we diagnosed on 2026-04-17. force_close=True means each
+    request gets a fresh TCP connection. There's a modest per-request cost
+    (~100ms TLS handshake) but connection reuse was the cause of the freezes,
+    not an optimization we can afford.
+    """
     connector = aiohttp.TCPConnector(
         limit=20,
         limit_per_host=10,
-        keepalive_timeout=30,
-        force_close=False,
+        force_close=True,
         enable_cleanup_closed=True,
     )
     app["upstream_session"] = aiohttp.ClientSession(
         connector=connector,
-        timeout=aiohttp.ClientTimeout(total=600),
+        timeout=aiohttp.ClientTimeout(total=600, sock_connect=10, sock_read=300),
     )
+
+    # Background sentinel: every 30s, count CLOSE_WAIT sockets owned by this
+    # process. If any appear (meaning force_close didn't fully prevent them),
+    # log and force a session rebuild. Cheap and self-healing.
+    async def close_wait_watchdog():
+        import subprocess
+        pid = os.getpid()
+        while True:
+            try:
+                await asyncio.sleep(30)
+                result = subprocess.run(
+                    ["ss", "-tan", "-p"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                # Count CLOSE-WAIT sockets owned by this process
+                count = 0
+                for line in result.stdout.splitlines():
+                    if "CLOSE-WAIT" in line and f"pid={pid}" in line:
+                        count += 1
+                if count > 0:
+                    log.warning(
+                        f"close-wait watchdog: {count} poisoned sockets; rebuilding session"
+                    )
+                    try:
+                        old_session = app["upstream_session"]
+                        new_connector = aiohttp.TCPConnector(
+                            limit=20, limit_per_host=10,
+                            force_close=True, enable_cleanup_closed=True,
+                        )
+                        app["upstream_session"] = aiohttp.ClientSession(
+                            connector=new_connector,
+                            timeout=aiohttp.ClientTimeout(total=600, sock_connect=10, sock_read=300),
+                        )
+                        await old_session.close()
+                    except Exception as e:
+                        log.error(f"session rebuild failed: {e}")
+            except Exception as e:
+                log.debug(f"watchdog tick failed: {e}")
+
+    app["watchdog_task"] = asyncio.create_task(close_wait_watchdog())
 
 async def on_cleanup(app):
     """Close the persistent session on shutdown."""
+    task = app.get("watchdog_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
     await app["upstream_session"].close()
 
 

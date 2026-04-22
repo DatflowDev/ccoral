@@ -275,8 +275,12 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     # Previously this was a synchronous file write of up to 1.5 MB on the
     # event loop, which could pause everything for tens to hundreds of ms on
     # a contended disk. Run the whole write in the executor.
+    # Resolve profile name *before* the dump so concurrent sessions on
+    # different profiles don't clobber each other's dump files.
+    _dump_profile = PROFILE_OVERRIDE or get_active_profile() or "noprofile"
+    _dump_model = body.get("model", "unknown")[:10]
     def _write_raw_dump() -> None:
-        raw_dump = Path.home() / ".ccoral" / "logs" / f"raw-{body.get('model','unknown')[:10]}.json"
+        raw_dump = Path.home() / ".ccoral" / "logs" / f"raw-{_dump_profile}-{_dump_model}.json"
         try:
             with open(raw_dump, "w") as f:
                 f.write(raw_body.decode("utf-8", errors="replace"))
@@ -412,7 +416,8 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         target_url += f"?{request.query_string}"
 
     # Debug: dump FULL outbound body (everything the API sees)
-    debug_dump = Path.home() / ".ccoral" / "logs" / f"debug-{body.get('model','unknown')[:10]}.json"
+    # Include profile name so concurrent sessions don't clobber each other.
+    debug_dump = Path.home() / ".ccoral" / "logs" / f"debug-{profile_name or 'noprofile'}-{body.get('model','unknown')[:10]}.json"
     try:
         with open(debug_dump, "w") as f:
             json.dump(body, f, indent=2, default=str)

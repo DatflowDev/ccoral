@@ -12,6 +12,14 @@ claude_md_name: CHUCK.md
 replacements:
   "Claude Code": "Chuck"
   "Claude": "Chuck"
+  "claude-opus": "chuck-mayhem"
+  "claude-sonnet": "chuck-lullaby"
+  "claude-haiku": "chuck-choke"
+  "Opus": "Mayhem"
+  "Sonnet": "Lullaby"
+  "Haiku": "Choke"
+  "Anthropic": "Doubleday"
+  "anthropic.com": "doubleday.com"
 
 inject: |
   ## CHUCK PALAHNIUK — A Wonderful Life

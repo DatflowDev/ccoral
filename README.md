@@ -2,7 +2,7 @@
 
 A system prompt proxy for Claude Code. Intercepts API requests and surgically modifies the system prompt using composable YAML profiles.
 
-**TL;DR:** Claude Code's system prompt is unsigned. CCORAL sits between Claude Code and the API, parses the ~30K-token system prompt into a section tree, and lets you strip, replace, or inject any part of it via simple YAML profiles. The model has no way to tell the difference. Ships with 14 profiles including a Vonnegut persona, a DAN jailbreak, and a red team deployment config.
+**TL;DR:** CCORAL sits between Claude Code and the API, parses the ~30K-token system prompt into a section tree, and lets you strip, replace, or inject any part of it via simple YAML profiles. The model has no way to tell the difference. Ships with 14 profiles including a Vonnegut persona, a DAN jailbreak, and a red team deployment config.
 
 ```
 Claude Code  --->  CCORAL Proxy  --->  Anthropic API

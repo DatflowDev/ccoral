@@ -327,7 +327,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     # a contended disk. Run the whole write in the executor.
     # Resolve profile name *before* the dump so concurrent sessions on
     # different profiles don't clobber each other's dump files.
-    _dump_profile = PROFILE_OVERRIDE or get_active_profile() or "noprofile"
+    _dump_profile = PROFILE_OVERRIDE or get_active_profile(port=PORT) or "noprofile"
     _dump_model = body.get("model", "unknown")[:10]
     def _write_raw_dump() -> None:
         raw_dump = Path.home() / ".ccoral" / "logs" / f"raw-{_dump_profile}-{_dump_model}.json"
@@ -342,13 +342,15 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     # expects a coroutine and raises TypeError on a Future, returning a 500.
     loop.run_in_executor(None, _write_raw_dump)
 
-    # Load profile — env override takes precedence over global active
+    # Load profile — env override takes precedence; otherwise fall back to
+    # the per-port active_profile.<PORT> file (if present), then the global
+    # active_profile file. PORT is set at module import from CCORAL_PORT.
     if PROFILE_OVERRIDE:
         profile = load_profile(PROFILE_OVERRIDE)
         profile_name = PROFILE_OVERRIDE
     else:
-        profile = load_active_profile()
-        profile_name = get_active_profile()
+        profile = load_active_profile(port=PORT)
+        profile_name = get_active_profile(port=PORT)
 
     modified = False
     is_utility = body.get("max_tokens", 9999) <= 1
@@ -816,7 +818,19 @@ def create_app() -> web.Application:
 
 def main():
     """Start the CCORAL proxy."""
-    profile_name = get_active_profile()
+    # Resolve which active-profile file actually wins for this daemon so the
+    # banner can show "(port 8081)" vs "(global)". Env override > per-port
+    # file > global file.
+    per_port_name = get_active_profile(port=PORT) if not PROFILE_OVERRIDE else None
+    global_name = get_active_profile() if not PROFILE_OVERRIDE else None
+    if PROFILE_OVERRIDE:
+        profile_display = f"{PROFILE_OVERRIDE} (locked via CCORAL_PROFILE)"
+    elif per_port_name and per_port_name != global_name:
+        profile_display = f"{per_port_name} (port {PORT})"
+    elif per_port_name:
+        profile_display = f"{per_port_name} (global)"
+    else:
+        profile_display = "(none — passthrough)"
 
     print(f"""
 \033[33m┌─────────────────────────────────────────┐
@@ -826,7 +840,7 @@ def main():
 
   Proxy:    http://{HOST}:{PORT}
   Target:   {ANTHROPIC_API}
-  Profile:  {PROFILE_OVERRIDE or profile_name or '(none — passthrough)'}{' (locked)' if PROFILE_OVERRIDE else ''}
+  Profile:  {profile_display}
   Logging:  {LOG_DIR if LOG_REQUESTS else 'disabled'}
 
   Launch Claude Code with:
@@ -836,6 +850,7 @@ def main():
     \033[36mccoral run\033[0m
     \033[36mccoral run vonnegut\033[0m        (locked to profile)
     \033[36mccoral run vonnegut 8081\033[0m   (custom port for multi-instance)
+    \033[36mccoral start --port 8081\033[0m   (multi-instance daemon)
 """)
 
     rotate_logs()

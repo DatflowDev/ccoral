@@ -62,28 +62,65 @@ def load_profile(name: str) -> Optional[dict]:
     return None
 
 
-def get_active_profile() -> Optional[str]:
-    """Get the currently active profile name."""
-    active_file = Path.home() / ".ccoral" / "active_profile"
-    if active_file.exists():
-        name = active_file.read_text().strip()
+def _active_profile_path(port: Optional[int]) -> Path:
+    """Return the file path that holds the active profile name.
+
+    With no port: the global ``~/.ccoral/active_profile`` file.
+    With a port: the per-port ``~/.ccoral/active_profile.<port>`` file
+    (used to scope active-profile state to one daemon when multiple
+    ccoral instances are running on different ports).
+    """
+    base = Path.home() / ".ccoral"
+    if port is not None:
+        return base / f"active_profile.{port}"
+    return base / "active_profile"
+
+
+def get_active_profile(port: Optional[int] = None) -> Optional[str]:
+    """Get the currently active profile name.
+
+    Resolution order:
+        1. If ``port`` is given AND ``~/.ccoral/active_profile.<port>``
+           exists and is non-empty, return its contents.
+        2. Otherwise fall back to the global ``~/.ccoral/active_profile``.
+        3. Return None if neither is set.
+    """
+    if port is not None:
+        per_port = _active_profile_path(port)
+        if per_port.exists():
+            name = per_port.read_text().strip()
+            if name:
+                return name
+            # File exists but empty — fall through to global rather than
+            # returning None, so an empty per-port file behaves like "unset".
+
+    global_file = _active_profile_path(None)
+    if global_file.exists():
+        name = global_file.read_text().strip()
         return name if name else None
     return None
 
 
-def set_active_profile(name: Optional[str]):
-    """Set the active profile."""
-    active_file = Path.home() / ".ccoral" / "active_profile"
-    active_file.parent.mkdir(parents=True, exist_ok=True)
+def set_active_profile(name: Optional[str], port: Optional[int] = None):
+    """Set or unset the active profile.
+
+    With no port: writes to (or removes) the global ``active_profile`` file.
+    With a port: writes to (or removes) the per-port file only — leaves the
+    global file untouched.
+
+    Pass ``name=None`` to unset.
+    """
+    target = _active_profile_path(port)
+    target.parent.mkdir(parents=True, exist_ok=True)
     if name:
-        active_file.write_text(name)
-    elif active_file.exists():
-        active_file.unlink()
+        target.write_text(name)
+    elif target.exists():
+        target.unlink()
 
 
-def load_active_profile() -> Optional[dict]:
-    """Load the currently active profile."""
-    name = get_active_profile()
+def load_active_profile(port: Optional[int] = None) -> Optional[dict]:
+    """Load the currently active profile (port-aware)."""
+    name = get_active_profile(port=port)
     if name:
         return load_profile(name)
     return None

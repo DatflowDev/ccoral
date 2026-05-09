@@ -25,7 +25,7 @@ from pathlib import Path
 
 # Add script directory to path (resolve symlinks)
 SCRIPT_DIR = Path(__file__).resolve().parent
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from profiles import (
@@ -61,8 +61,37 @@ BOLD = "\033[1m"
 NC = "\033[0m"
 
 
-def cmd_start():
-    """Start the proxy server."""
+def _extract_port(argv: list[str]) -> tuple[list[str], int | None]:
+    """Strip ``--port <n>`` from argv and return (argv_without_port, port_or_None).
+
+    Used by main() to pull the top-level --port flag out before the
+    per-command arg dispatch, so every subcommand can opt in uniformly.
+    """
+    port = None
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--port" and i + 1 < len(argv):
+            try:
+                port = int(argv[i + 1])
+            except ValueError:
+                print(f"{R}--port requires an integer{NC}")
+                sys.exit(1)
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    return out, port
+
+
+def cmd_start(port: int | None = None):
+    """Start the proxy server.
+
+    server.py reads CCORAL_PORT at module import time (top-level), so the
+    env var MUST be set before the import to take effect.
+    """
+    if port is not None:
+        os.environ["CCORAL_PORT"] = str(port)
     from server import main
     main()
 
@@ -151,23 +180,34 @@ def cmd_run(profile_name: str = None, port: int = None, resume: str = None):
         print(f"\n{Y}CCORAL proxy stopped.{NC}")
 
 
-def cmd_use(name: str):
-    """Activate a profile."""
+def cmd_use(name: str, port: int | None = None):
+    """Activate a profile.
+
+    With ``port`` set, writes only the per-port file
+    (``~/.ccoral/active_profile.<port>``) — leaves the global file untouched.
+    Without ``port``, writes the global ``active_profile`` file.
+    """
     profile = load_profile(name)
     if not profile:
         print(f"{R}Profile not found: {name}{NC}")
         print(f"Available: {', '.join(p['name'] for p in list_profiles())}")
         sys.exit(1)
 
-    set_active_profile(name)
-    print(f"{G}Active profile: {BOLD}{name}{NC}")
+    set_active_profile(name, port=port)
+    scope = f"port {port}" if port is not None else "global"
+    print(f"{G}Active profile: {BOLD}{name}{NC} ({scope})")
     print(f"  {profile.get('description', '')}")
 
 
-def cmd_off():
-    """Deactivate profile."""
-    set_active_profile(None)
-    print(f"{Y}Profile deactivated — passthrough mode{NC}")
+def cmd_off(port: int | None = None):
+    """Deactivate profile.
+
+    With ``port`` set, removes only the per-port file. Without ``port``,
+    removes the global ``active_profile`` file.
+    """
+    set_active_profile(None, port=port)
+    scope = f"port {port}" if port is not None else "global"
+    print(f"{Y}Profile deactivated — passthrough mode ({scope}){NC}")
 
 
 def cmd_profiles():
@@ -194,20 +234,34 @@ def cmd_profiles():
     print()
 
 
-def cmd_status():
-    """Show current status."""
-    active = get_active_profile()
-    profile = load_active_profile()
+def cmd_status(port: int | None = None):
+    """Show current status.
+
+    With ``port``, resolves the active profile for that port (per-port file
+    if present, else global). Without ``port``, shows the global only.
+    """
+    active = get_active_profile(port=port)
+    profile = load_active_profile(port=port)
 
     print(f"\n{BOLD}CCORAL v{VERSION} Status{NC}\n")
     print(f"  Profile:  {C}{active or '(none)'}{NC}")
+    if port is not None:
+        # Show which file is actually winning so users can debug overrides.
+        per_port_file = Path.home() / ".ccoral" / f"active_profile.{port}"
+        global_file = Path.home() / ".ccoral" / "active_profile"
+        if per_port_file.exists() and per_port_file.read_text().strip():
+            print(f"  Source:   {per_port_file} (per-port)")
+        elif global_file.exists() and global_file.read_text().strip():
+            print(f"  Source:   {global_file} (global fallback)")
+        else:
+            print(f"  Source:   (none)")
     if profile:
         print(f"  Desc:     {profile.get('description', '')}")
         preserve = profile.get('preserve', [])
         print(f"  Preserve: {', '.join(preserve) if preserve else '(defaults)'}")
         inject_len = len(profile.get('inject', ''))
         print(f"  Inject:   {inject_len} chars")
-    print(f"  Port:     {PORT}")
+    print(f"  Port:     {port if port is not None else PORT}")
 
     log_dir = Path.home() / ".ccoral" / "logs"
     if log_dir.exists():
@@ -372,11 +426,14 @@ def main():
         usage()
 
     cmd = sys.argv[1]
+    # Strip the top-level --port flag from the rest of argv before per-command
+    # dispatch so every subcommand can opt in uniformly.
+    argv_rest, cli_port = _extract_port(sys.argv[2:])
 
     if cmd == "start":
-        cmd_start()
+        cmd_start(port=cli_port)
     elif cmd == "run":
-        run_args = sys.argv[2:]
+        run_args = list(argv_rest)
         run_resume = None
         if "--resume" in run_args:
             idx = run_args.index("--resume")
@@ -387,34 +444,38 @@ def main():
                 print(f"{R}--resume requires a conversation name{NC}")
                 sys.exit(1)
         run_profile = run_args[0] if run_args and not run_args[0].isdigit() else None
-        run_port = None
-        for arg in run_args:
-            if arg.isdigit():
-                run_port = int(arg)
+        # Existing positional-digit port detection retained for back-compat
+        # (e.g. `ccoral run vonnegut 8081`). If both --port and a positional
+        # digit are supplied, the explicit --port wins.
+        run_port = cli_port
+        if run_port is None:
+            for arg in run_args:
+                if arg.isdigit():
+                    run_port = int(arg)
         cmd_run(profile_name=run_profile, port=run_port, resume=run_resume)
     elif cmd == "use":
-        if len(sys.argv) < 3:
-            print(f"{R}Usage: ccoral use <profile>{NC}")
+        if len(argv_rest) < 1:
+            print(f"{R}Usage: ccoral use <profile> [--port <n>]{NC}")
             sys.exit(1)
-        cmd_use(sys.argv[2])
+        cmd_use(argv_rest[0], port=cli_port)
     elif cmd == "new":
-        if len(sys.argv) < 3:
+        if len(argv_rest) < 1:
             print(f"{R}Usage: ccoral new <name>{NC}")
             sys.exit(1)
-        cmd_new(sys.argv[2])
+        cmd_new(argv_rest[0])
     elif cmd == "edit":
-        if len(sys.argv) < 3:
+        if len(argv_rest) < 1:
             print(f"{R}Usage: ccoral edit <name>{NC}")
             sys.exit(1)
-        cmd_edit(sys.argv[2])
+        cmd_edit(argv_rest[0])
     elif cmd == "room":
-        cmd_room(sys.argv[2:])
+        cmd_room(argv_rest)
     elif cmd == "off":
-        cmd_off()
+        cmd_off(port=cli_port)
     elif cmd in ("profiles", "list", "ls"):
         cmd_profiles()
     elif cmd == "status":
-        cmd_status()
+        cmd_status(port=cli_port)
     elif cmd == "log":
         cmd_log()
     elif cmd in ("version", "--version", "-V"):

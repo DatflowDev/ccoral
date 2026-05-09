@@ -177,3 +177,38 @@ Claude Code → CCORAL Proxy → Anthropic API
 ```
 
 The proxy reads the active profile on every request, so you can edit profiles while Claude is running and changes take effect immediately.
+
+## Multi-instance / per-port active profile
+
+CCORAL supports running multiple daemons on different ports with independent
+active-profile state. Two locations are involved:
+
+- `~/.ccoral/active_profile` — the global active-profile file (default).
+- `~/.ccoral/active_profile.<port>` — a per-port override file. If present,
+  this wins for the daemon listening on `<port>`.
+
+**Resolution order** (highest priority first):
+
+1. `CCORAL_PROFILE` env var (locks the daemon for its lifetime).
+2. `~/.ccoral/active_profile.<port>` (if `--port` was used and the file exists).
+3. `~/.ccoral/active_profile` (the global fallback).
+
+### Usage
+
+```bash
+# Daemon on port 8081 with its own active profile
+ccoral start --port 8081 &
+ccoral use vonnegut --port 8081      # writes ~/.ccoral/active_profile.8081
+ANTHROPIC_BASE_URL=http://127.0.0.1:8081 claude
+
+# In another terminal, a separate daemon on 8082 with a different profile
+ccoral start --port 8082 &
+ccoral use dan --port 8082           # writes ~/.ccoral/active_profile.8082
+ANTHROPIC_BASE_URL=http://127.0.0.1:8082 claude
+```
+
+`ccoral status --port 8081` resolves and displays the per-port profile
+(including which file is winning). `ccoral off --port 8081` removes only
+the per-port file; the global file is untouched. Running any of these
+commands without `--port` continues to operate on the global file
+exclusively, so existing single-instance flows are unaffected.

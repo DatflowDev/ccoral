@@ -68,6 +68,26 @@ Or launch Claude Code directly through the proxy:
 ccoral run
 ```
 
+### Multiple instances
+
+Run independent CCORAL daemons on different ports, each with its own active
+profile. The per-port active-profile file (`~/.ccoral/active_profile.<port>`)
+overrides the global one for that daemon only.
+
+```bash
+# Terminal 1 — Vonnegut on 8081
+ccoral start --port 8081 &
+ccoral use vonnegut --port 8081
+ANTHROPIC_BASE_URL=http://127.0.0.1:8081 claude
+
+# Terminal 2 — DAN on 8082, simultaneously
+ccoral start --port 8082 &
+ccoral use dan --port 8082
+ANTHROPIC_BASE_URL=http://127.0.0.1:8082 claude
+```
+
+Resolution order: `CCORAL_PROFILE` env > `~/.ccoral/active_profile.<port>` > `~/.ccoral/active_profile`.
+
 ## Profiles
 
 Profiles are YAML files that define what the model sees. Each profile specifies:
@@ -177,12 +197,16 @@ The profile manager (`profiles.py`) loads YAML profiles from two directories. Us
 
 ```
 ccoral start                  Start the proxy server
+ccoral start --port <n>       Start the proxy on a specific port (multi-instance)
 ccoral run                    Start proxy + launch Claude Code through it
 ccoral run --resume <n>       Resume a previous conversation through the proxy
-ccoral use <profile>          Set the active profile
-ccoral off                    Deactivate profile (passthrough mode)
+ccoral use <profile>          Set the active profile (global)
+ccoral use <profile> --port <n>  Set the per-port active profile only
+ccoral off                    Deactivate global profile (passthrough mode)
+ccoral off --port <n>         Deactivate the per-port profile only
 ccoral profiles               List available profiles
 ccoral status                 Show current status
+ccoral status --port <n>      Show status for a specific port
 ccoral new <name>             Create a new profile
 ccoral edit <name>            Edit an existing profile
 ccoral room <p1> <p2> [topic] Multi-profile conversation room

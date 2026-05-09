@@ -46,20 +46,38 @@ class Block:
     original: Optional[dict] = None  # Original API block dict
 
 
-# Known section identifiers and their canonical names
-# Maps (header_text or pattern) → canonical_name
+# Known section identifiers and their canonical names.
+# Maps (header_text or XML tag, lowercased) → canonical_name.
+#
+# Refreshed for Claude Code 2.1.138 (May 2026). The CC system prompt is
+# assembled from ~25-50 fragments and headers come and go between minor
+# versions. The current set:
+#   - Headers PRESENT in modern CC: # Harness, # Executing actions with care,
+#     # Text output (does not apply to tool calls), # Committing changes with git,
+#     # Creating pull requests, # Other common operations, # Environment.
+#   - A few legacy headers from 2.1.13x and earlier are still kept (# System,
+#     # Doing tasks, # Tone and style, # auto memory) so the parser tolerates
+#     a fixture range. Dead matchers from older versions ("using your tools",
+#     "tool usage policy", "output efficiency", "important: you must never",
+#     "fast_mode_info") have been dropped — see PROFILE_SCHEMA.md for the
+#     deprecated list.
+#   - HEADERLESS prose fragments (action-safety, doing-tasks, tool-usage,
+#     tone-and-style, agent-thread-notes, memory-instructions) are matched
+#     via PROSE_FRAGMENT_LEAD_SENTENCES below.
 SECTION_IDENTIFIERS = {
     # Identity
     "you are claude code": "identity",
 
-    # Core behavior
+    # Core behavior — modern (2.1.124+)
+    "harness": "harness",
+    "text output (does not apply to tool calls)": "text_output",
+    "text output": "text_output",  # fallback if header gets trimmed/folded
+    "executing actions with care": "executing_actions",
+
+    # Core behavior — legacy headers still observed in 2.1.13x fixtures
     "system": "system",
     "doing tasks": "doing_tasks",
-    "using your tools": "using_tools",
-    "tool usage policy": "tool_usage_policy",
     "tone and style": "tone_style",
-    "output efficiency": "output_efficiency",
-    "executing actions with care": "executing_actions",
     "auto memory": "auto_memory",
 
     # Environment & config
@@ -70,18 +88,77 @@ SECTION_IDENTIFIERS = {
 
     # Security
     "important: assist with authorized": "security_policy",
-    "important: you must never": "url_policy",
 
     # XML sections
-    "available-deferred-tools": "deferred_tools",
+    # NB: case-folded via xml_match.group(1).lower() before equality check.
+    "available-deferred-tools": "deferred_tools",  # dead in 2.1.x but cheap; keep for legacy
     "system-reminder": "system_reminder",
-    "fast_mode_info": "fast_mode",
+    "command-message": "command_message",
+    "command-name": "command_name",
+    "command-args": "command_args",
 
     # Claude.md / project instructions
     "claudemd": "claude_md",
     "currentdate": "current_date",
     "memory index": "memory_index",
 }
+
+
+# Prose fragments that arrive WITHOUT a markdown header — match by leading
+# substring. List of (lead_substring, canonical_name) tuples. Matching is
+# case-insensitive, longest-prefix-wins. Lead substrings copied verbatim
+# from system-prompts/system-prompt-*.md in
+# https://github.com/Piebald-AI/claude-code-system-prompts (v2.1.124+).
+#
+# Section type for these is "prose_fragment" — does NOT participate in
+# XML close-tag tracking.
+PROSE_FRAGMENT_LEAD_SENTENCES: list[tuple[str, str]] = [
+    # action-safety-and-truthful-reporting (2.1.136+)
+    (
+        "For actions that are hard to reverse or outward-facing, confirm first unless durably authorized",
+        "action_safety",
+    ),
+    # doing-tasks-software-engineering-focus
+    (
+        "The user will primarily request you to perform software engineering tasks.",
+        "doing_tasks",
+    ),
+    # tool-usage-task-management
+    (
+        "Break down and manage your work with the",
+        "tool_usage",
+    ),
+    # tool-usage-subagent-guidance
+    (
+        "Use the ${TASK_TOOL_NAME} tool with specialized agents when the task at hand matches",
+        "tool_usage",
+    ),
+    # parallel-tool-call-note
+    (
+        "You can call multiple tools in a single response. If you intend to call multiple tools",
+        "tool_usage",
+    ),
+    # tone-and-style-code-references
+    (
+        "When referencing specific functions or pieces of code include the pattern file_path:line_number",
+        "tone_style",
+    ),
+    # tone-and-style-concise-output-short
+    (
+        "Your responses should be short and concise.",
+        "tone_style",
+    ),
+    # agent-thread-notes (subagent-only)
+    (
+        "- Agent threads always have their cwd reset between bash calls, as a result please only use absolute file paths.",
+        "agent_thread_notes",
+    ),
+    # memory-instructions
+    (
+        "You have a persistent file-based memory",
+        "memory_instructions",
+    ),
+]
 
 
 def _identify_section(line: str) -> tuple[Optional[str], str, int]:
@@ -119,6 +196,19 @@ def _identify_section(line: str) -> tuple[Optional[str], str, int]:
     # Identity sentence
     if stripped.lower().startswith("you are claude code"):
         return "identity", "identity", 0
+
+    # Prose fragments without headers (longest-prefix-wins).
+    # Modern CC ships several behavioral fragments as bare paragraphs;
+    # we match by leading substring against PROSE_FRAGMENT_LEAD_SENTENCES.
+    lower = stripped.lower()
+    best_lead = ""
+    best_name: Optional[str] = None
+    for lead, name in PROSE_FRAGMENT_LEAD_SENTENCES:
+        if lower.startswith(lead.lower()) and len(lead) > len(best_lead):
+            best_lead = lead
+            best_name = name
+    if best_name is not None:
+        return best_name, "prose_fragment", 0
 
     # IMPORTANT: lines (standalone policy statements)
     if stripped.startswith("IMPORTANT:"):
@@ -283,16 +373,29 @@ def apply_profile(blocks: list[Block], profile: dict) -> list[Block]:
         "memory": "memory_index",
         "system": "system",
         "current_date": "current_date",
+        # CC 2.1.124+ canonicals — let profiles list these by friendly name.
+        "harness": "harness",
+        "text_output": "text_output",
+        "action_safety": "action_safety",
+        "tool_usage": "tool_usage",
+        "tone_style": "tone_style",
+        "agent_thread_notes": "agent_thread_notes",
+        "memory_instructions": "memory_instructions",
     }
     canonical_preserve = set()
     for p in preserve:
         canonical_preserve.add(preserve_map.get(p, p))
 
     # Default preserves unless minimal or strict — keep it tight:
-    # environment (OS/shell/cwd), tools (MCP definitions), current_date, claude_md
+    # environment (OS/shell/cwd), tools (MCP definitions), current_date, claude_md,
+    # and harness (since identity now lives inside `# Harness` and the inject path
+    # only replaces the identity sentence — without preserving harness, the
+    # bullets that contextualize the agent get dropped).
     # Notably NOT preserved by default: system_reminder, memory_index, _preamble
     if not minimal and not strict:
-        canonical_preserve.update({"environment", "deferred_tools", "current_date", "claude_md"})
+        canonical_preserve.update(
+            {"environment", "deferred_tools", "current_date", "claude_md", "harness"}
+        )
 
     # Custom .md file support — profile can specify e.g. claude_md_name: ALBERT.md
     custom_md_name = profile.get("claude_md_name")

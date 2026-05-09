@@ -51,27 +51,52 @@ strict: false         # default: false
 
 ## Section Names
 
-The parser identifies these sections in Claude Code's system prompt:
+The parser identifies these sections in Claude Code's system prompt
+(refreshed for Claude Code 2.1.138, May 2026). Modern CC assembles the
+system prompt from ~25-50 fragments; some are markdown-headed, others
+are bare prose matched by leading sentence.
 
-| Canonical Name     | What It Contains                                     | Default |
-|--------------------|------------------------------------------------------|---------|
-| `identity`         | "You are Claude Code..." opening                     | REPLACED by inject |
-| `security_policy`  | IMPORTANT: security testing policy                   | stripped |
-| `doing_tasks`      | Task execution guidelines                            | stripped |
-| `using_tools`      | Tool usage instructions                              | stripped |
-| `tool_usage_policy`| Detailed tool policies                               | stripped |
-| `tone_style`       | Tone and style rules                                 | stripped |
-| `output_efficiency`| Output brevity rules                                 | stripped |
-| `executing_actions`| Caution/confirmation rules                           | stripped |
-| `auto_memory`      | Memory system instructions                           | stripped |
-| `git_commit`       | Git commit instructions                              | stripped |
-| `pull_requests`    | PR creation instructions                             | stripped |
-| `environment`      | OS, shell, cwd, model info                           | **kept** |
-| `deferred_tools`   | Available tool definitions (XML block)               | **kept** |
-| `system_reminder`  | System reminder XML blocks                           | **kept** |
-| `claude_md`        | CLAUDE.md contents                                   | **kept** |
-| `current_date`     | Today's date                                         | **kept** |
-| `memory_index`     | MEMORY.md auto-memory index                          | **kept** |
+| Canonical Name        | What It Contains                                              | Default |
+|-----------------------|---------------------------------------------------------------|---------|
+| `identity`            | "You are Claude Code..." opening (lives inside `# Harness`)   | REPLACED by inject |
+| `harness`             | `# Harness` block — tool/permission/markdown bullets (NEW)    | **kept** |
+| `text_output`         | `# Text output (does not apply to tool calls)` (NEW)          | stripped |
+| `executing_actions`   | `# Executing actions with care` — caution/confirmation rules  | stripped |
+| `action_safety`       | Action-safety-and-truthful-reporting prose fragment (NEW)     | stripped |
+| `doing_tasks`         | Task-execution prose fragment (no header in modern CC)        | stripped |
+| `tool_usage`          | Task-management / subagent-guidance / parallel-call prose     | stripped |
+| `tone_style`          | Tone-and-style prose fragments (code-references, concise)     | stripped |
+| `auto_memory`         | Auto-memory header (legacy; still seen in some fixtures)      | stripped |
+| `memory_instructions` | `# Memory` / persistent file-based memory instructions (NEW)  | stripped |
+| `agent_thread_notes`  | Subagent-only behavioral notes (absolute paths, no emoji)     | stripped |
+| `system`              | `# System` legacy header (older CC builds)                    | stripped |
+| `security_policy`     | `IMPORTANT: Assist with authorized…` policy line              | stripped |
+| `git_commit`          | `# Committing changes with git` — git commit instructions     | stripped |
+| `pull_requests`       | `# Creating pull requests` — PR creation instructions         | stripped |
+| `other_operations`    | `# Other common operations`                                   | stripped |
+| `environment`         | `# Environment` — OS, shell, cwd, model info                  | **kept** |
+| `deferred_tools`      | Available tool definitions (XML; legacy in 2.1.x)             | **kept** |
+| `system_reminder`     | `<system-reminder>` XML blocks                                | stripped |
+| `command_message`     | `<command-message>` slash-command body (NEW)                  | stripped |
+| `command_name`        | `<command-name>` slash-command name (NEW)                     | stripped |
+| `command_args`        | `<command-args>` slash-command args (NEW)                     | stripped |
+| `claude_md`           | CLAUDE.md contents                                            | **kept** |
+| `current_date`        | Today's date                                                  | **kept** |
+| `memory_index`        | MEMORY.md auto-memory index (legacy)                          | stripped |
+
+### Deprecated (CC 2.1.x removed)
+
+These keys were matched against headers in older CC builds but no longer
+appear in 2.1.138 fixtures. Profiles that listed them under `preserve`
+silently no-op. Remove from your profiles to avoid confusion.
+
+| Removed Canonical | Why                                                                |
+|-------------------|--------------------------------------------------------------------|
+| `using_tools`     | `# Using your tools` header dropped from CC; covered by `tool_usage` prose matchers. |
+| `tool_usage_policy` | `# Tool usage policy` header dropped; same coverage as above.    |
+| `output_efficiency` | `# Output efficiency` header never observed in modern CC.        |
+| `url_policy`      | `IMPORTANT: You must never...` line removed in 2.1.x.              |
+| `fast_mode`       | `<fast_mode_info>` XML tag not present in 2.1.x.                   |
 
 ## Examples
 

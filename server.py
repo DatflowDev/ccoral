@@ -70,6 +70,22 @@ _SYSTEM_REMINDER_RE = re.compile(
 )
 
 
+def model_tier(model: str | None) -> str:
+    """Return one of: 'opus', 'sonnet', 'haiku', 'unknown'.
+
+    Robust to dated and routing-slug variants like 'claude-opus-4-7[1m]' or
+    'claude-haiku-4-5-20251001'.
+    """
+    m = (model or "").lower()
+    if "haiku" in m:
+        return "haiku"
+    if "sonnet" in m:
+        return "sonnet"
+    if "opus" in m:
+        return "opus"
+    return "unknown"
+
+
 def strip_message_tags(body: dict, profile: dict) -> int:
     """
     Strip <system-reminder> tags from the messages array.
@@ -337,7 +353,10 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     modified = False
     is_utility = body.get("max_tokens", 9999) <= 1
     model = body.get("model", "")
-    is_haiku = "haiku" in model
+    tier = model_tier(model)
+    is_haiku = tier == "haiku"
+    if tier == "unknown" and model:
+        log.warning(f"Unknown model tier for: {model!r} — treated as main-tier")
     haiku_inject = profile.get("haiku_inject") if profile else None
     replacements = profile.get("replacements", {}) if profile else {}
 
@@ -351,7 +370,10 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         orig_size = 0
 
     # Threshold: main conversation has the full ~27K system prompt
-    SUBAGENT_THRESHOLD = 15000
+    # CC 2.1.138 sizing: main convo system prompt 30K-35K+ chars; subagent
+    # 5K-12K typical, can spike to 15K-18K with heavy CLAUDE.md or
+    # system-reminders. 22K threshold gives clean separation.
+    SUBAGENT_THRESHOLD = 22000
 
     if profile and is_utility:
         # Utility call (counting, etc.) — skip everything
@@ -577,7 +599,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             if captured_text is not None and captured_text:
                 full_text = "".join(captured_text).strip()
                 model = body.get("model", "")
-                is_haiku = "haiku" in model
+                is_haiku = model_tier(model) == "haiku"
                 is_json = full_text.startswith("{") and full_text.endswith("}")
                 is_too_short = len(full_text) < 20
 

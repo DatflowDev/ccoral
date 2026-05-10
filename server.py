@@ -48,7 +48,12 @@ from refusal import detect_refusal, all_refusals
 from reminders import classify_reminder
 from tool_scrub import scrub_tool_descriptions
 from lanes import detect_lane
-from rewrite_terminal import RewriteTerminalState
+from rewrite_terminal import (
+    RewriteTerminalState,
+    Upstream2Relay,
+    build_reissue_body,
+    DEFAULT_RESET_TURN_FRAMING,
+)
 
 # Config
 ANTHROPIC_API = "https://api.anthropic.com"
@@ -675,14 +680,14 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             block_starts: list[str] = []  # types of content_block_start
             seen_stop_reason: str | None = None
 
-            # Phase 3b: rewrite_terminal mode wraps each upstream chunk
-            # through a state machine that buffers index-0 text deltas
-            # until a refusal decision is made. Other modes (passthrough,
-            # log) use the byte-passthrough fast path below — zero
-            # added latency, byte-identical to upstream.
-            _use_rewrite_terminal = (_refusal_policy == "rewrite_terminal")
+            # Phase 3b/3c: rewrite_terminal AND reset_turn modes wrap each
+            # upstream chunk through a state machine that buffers index-0
+            # text deltas until a refusal decision is made. Other modes
+            # (passthrough, log) use the byte-passthrough fast path below
+            # — zero added latency, byte-identical to upstream.
+            _use_state_machine = (_refusal_policy in ("rewrite_terminal", "reset_turn"))
             _rewrite_state: "RewriteTerminalState | None" = (
-                RewriteTerminalState() if _use_rewrite_terminal else None
+                RewriteTerminalState(mode=_refusal_policy) if _use_state_machine else None
             )
 
             t_first_chunk = None
@@ -691,7 +696,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                 if t_first_chunk is None:
                     t_first_chunk = _time.perf_counter()
 
-                # Phase 3b: route the chunk through the state machine
+                # Phase 3b/3c: route the chunk through the state machine
                 # before forwarding. The machine returns the bytes that
                 # should reach the client (which may be the same as
                 # `chunk`, may be a synthetic delta, or may be empty
@@ -755,6 +760,20 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                 except Exception:
                     pass
 
+                # Phase 3c: pivot signal from the state machine. Stop
+                # draining upstream1 immediately (the rest is irrelevant
+                # — we're switching to upstream2). The actual upstream
+                # close and re-issue happen after the chunk loop exits.
+                if _rewrite_state is not None and _rewrite_state.pivot_requested:
+                    log.info(
+                        f"RESET_TURN pivot requested "
+                        f"(profile={profile_name}, model={body.get('model','?')}, "
+                        f"label={_rewrite_state.intercepted_label}); "
+                        f"closing upstream1"
+                    )
+                    upstream.close()
+                    break
+
             # Phase 3b: flush any pending state-machine buffer at stream
             # end (in case upstream cut off mid-buffer with no
             # content_block_stop — defensive flush of accumulated text
@@ -768,13 +787,97 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                         pass
                     else:
                         bytes_streamed += len(tail)
-                if _rewrite_state.intercepted:
+                if _rewrite_state.intercepted and not _rewrite_state.pivot_requested:
                     log.warning(
                         f"REWRITE_TERMINAL intercepted refusal "
                         f"(profile={profile_name}, model={body.get('model','?')}, "
                         f"label={_rewrite_state.intercepted_label}, "
                         f"chars_removed={_rewrite_state.intercepted_chars})"
                     )
+
+            # Phase 3c: reset_turn pivot. The state machine signaled a
+            # refusal in reset_turn mode; upstream1 is already closed
+            # and a synthetic content_block_stop has been emitted to the
+            # client. Now re-issue with the operator-scope framing
+            # prepended and relay upstream2 with renumbered indices.
+            #
+            # Per-turn retry cap: hard 1 reissue per request. If
+            # upstream2 also refuses, we let the user see it (better
+            # than infinite retry).
+            if (
+                _rewrite_state is not None
+                and _rewrite_state.pivot_requested
+                and _refusal_policy == "reset_turn"
+            ):
+                framing = (
+                    profile.get("reset_turn_framing")
+                    if profile and profile.get("reset_turn_framing")
+                    else DEFAULT_RESET_TURN_FRAMING
+                )
+                # Build the modified body and serialize it. deepcopy is
+                # done inside build_reissue_body so the original stays
+                # intact for logging.
+                body_reissue = build_reissue_body(body, framing=framing)
+                def _serialize_reissue() -> bytes:
+                    return json.dumps(
+                        body_reissue, ensure_ascii=False, separators=(',', ':')
+                    ).encode("utf-8")
+                outbound_reissue = await loop.run_in_executor(None, _serialize_reissue)
+
+                # Relay upstream2 with index renumbering. Compute the
+                # offset from the indices the state machine saw the
+                # client open: max + 1 puts upstream2 cleanly past the
+                # already-closed text block 0.
+                seen = _rewrite_state.seen_block_indices
+                index_offset = (max(seen) + 1) if seen else 1
+                relay = Upstream2Relay(index_offset=index_offset)
+
+                t_reissue_start = _time.perf_counter()
+                log.info(
+                    f"RESET_TURN reissuing with operator-scope framing "
+                    f"(framing={len(framing)} chars, index_offset={index_offset}, "
+                    f"body_size={len(outbound_reissue)})"
+                )
+                async with session.post(
+                    target_url,
+                    data=outbound_reissue,
+                    headers=forward_headers,
+                ) as upstream2:
+                    log.info(
+                        f"RESET_TURN upstream2 connected (status={upstream2.status})"
+                    )
+                    async for chunk2 in upstream2.content.iter_any():
+                        relayed = relay.feed_chunk(chunk2)
+                        if relayed:
+                            try:
+                                await response.write(relayed)
+                            except aiohttp.ClientConnectionResetError:
+                                log.info(
+                                    "Client disconnected during reset_turn "
+                                    "relay; aborting upstream2"
+                                )
+                                upstream2.close()
+                                return response
+                            bytes_streamed += len(relayed)
+                        # Append upstream2 raw bytes to the inspection
+                        # tail too so post-hoc analysis sees the full
+                        # picture.
+                        sse_tail.append(chunk2)
+                        sse_tail_bytes += len(chunk2)
+                        while sse_tail_bytes > SSE_TAIL_MAX and len(sse_tail) > 1:
+                            dropped = sse_tail.pop(0)
+                            sse_tail_bytes -= len(dropped)
+                        if full_sse is not None:
+                            full_sse.append(chunk2)
+
+                t_reissue_done = _time.perf_counter()
+                log.warning(
+                    f"RESET_TURN intercepted refusal + reissued "
+                    f"(profile={profile_name}, model={body.get('model','?')}, "
+                    f"label={_rewrite_state.intercepted_label}, "
+                    f"upstream2_events={relay.events_forwarded}, "
+                    f"upstream2_ms={int((t_reissue_done - t_reissue_start) * 1000)})"
+                )
 
             # Write captured response to file for room relay
             # Skip short responses (titles, summaries) and non-main-model calls

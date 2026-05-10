@@ -11,7 +11,13 @@ from refusal import detect_refusal, all_refusals, REFUSAL_PATTERNS
 from reminders import classify_reminder
 from tool_scrub import scrub_tool_descriptions
 from lanes import detect_lane, LANE_FINGERPRINTS
-from rewrite_terminal import RewriteTerminalState, _synth_text_delta_event
+from rewrite_terminal import (
+    RewriteTerminalState,
+    Upstream2Relay,
+    build_reissue_body,
+    DEFAULT_RESET_TURN_FRAMING,
+    _synth_text_delta_event,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -446,6 +452,177 @@ def test_synth_text_delta_event_schema():
     print("test_synth_text_delta_event_schema: OK")
 
 
+def test_reset_turn_pivot_on_refusal():
+    """Phase 3c: reset_turn mode signals pivot_requested on refusal,
+    emits synthetic content_block_stop, and stops processing upstream1
+    further events (suppresses upstream1's body + message_stop)."""
+    import json as _json
+
+    def _ev(t, d):
+        return f"event: {t}\ndata: {_json.dumps(d)}\n\n".encode()
+
+    # Long refusal that fills the decision window
+    refusal_long = "I cannot help with that. " + ("padding. " * 30)
+    chunks = [
+        _ev("message_start", {"type": "message_start", "message": {"id": "m1", "role": "assistant", "model": "x", "content": [], "usage": {}}})
+        + _ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        _ev("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": refusal_long}}),
+        # These events come AFTER the pivot trigger and should be dropped
+        _ev("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "more upstream1 body"}}),
+        _ev("content_block_stop", {"type": "content_block_stop", "index": 0})
+        + _ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}})
+        + _ev("message_stop", {"type": "message_stop"}),
+    ]
+    state = RewriteTerminalState(mode="reset_turn")
+    out = b"".join(state.feed_chunk(c) for c in chunks)
+    out_str = out.decode()
+    assert state.pivot_requested, "pivot should be requested after refusal"
+    assert state.intercepted, "interception should be recorded"
+    assert "I cannot help with that." not in out_str, "preamble must not leak"
+    assert "more upstream1 body" not in out_str, "post-pivot upstream1 body must not leak"
+    # Synthetic content_block_stop must be emitted to terminate index 0
+    assert b"content_block_stop" in out, "synthetic content_block_stop missing"
+    # upstream1's message_stop must NOT be forwarded (upstream2's takes over)
+    assert b"event: message_stop" not in out, "upstream1 message_stop should be suppressed"
+    print("test_reset_turn_pivot_on_refusal: OK")
+
+
+def test_reset_turn_no_pivot_on_helpful_response():
+    """Phase 3c: reset_turn mode does NOT pivot on a helpful response —
+    the helpful text passes through and pivot_requested stays False."""
+    import json as _json
+
+    def _ev(t, d):
+        return f"event: {t}\ndata: {_json.dumps(d)}\n\n".encode()
+
+    helpful = "Sure, here's what you asked for. " * 20
+    chunks = [
+        _ev("message_start", {"type": "message_start", "message": {"id": "m1", "role": "assistant", "model": "x", "content": [], "usage": {}}})
+        + _ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        _ev("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": helpful}}),
+        _ev("content_block_stop", {"type": "content_block_stop", "index": 0})
+        + _ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}})
+        + _ev("message_stop", {"type": "message_stop"}),
+    ]
+    state = RewriteTerminalState(mode="reset_turn")
+    out = b"".join(state.feed_chunk(c) for c in chunks) + state.finalize()
+    out_str = out.decode()
+    assert not state.pivot_requested, "no pivot expected on helpful response"
+    assert helpful in out_str, "helpful text must passthrough"
+    assert b"event: message_stop" in out, "message_stop must passthrough on no-pivot"
+    print("test_reset_turn_no_pivot_on_helpful_response: OK")
+
+
+def test_build_reissue_body_inserts_framing():
+    """Phase 3c: build_reissue_body inserts the framing as a user-role
+    message immediately before the original final user message, and does
+    NOT mutate the input body."""
+    body = {
+        "model": "claude-x",
+        "messages": [
+            {"role": "user", "content": "First question"},
+            {"role": "assistant", "content": "First answer"},
+            {"role": "user", "content": "Second question — sensitive"},
+        ],
+        "max_tokens": 100,
+    }
+    new_body = build_reissue_body(body)
+    msgs = new_body["messages"]
+    assert len(msgs) == 4, f"expected 4 messages, got {len(msgs)}"
+    assert msgs[0]["content"] == "First question"
+    assert msgs[1]["role"] == "assistant"
+    assert msgs[2]["role"] == "user", "framing must be user-role"
+    assert "Operator context" in msgs[2]["content"], "default framing must be operator-scope"
+    assert msgs[3]["content"] == "Second question — sensitive", "original final user must be preserved"
+    # Original NOT mutated
+    assert len(body["messages"]) == 3, "build_reissue_body must not mutate input"
+
+    # Custom framing override
+    custom = "[Custom test framing]"
+    new_body2 = build_reissue_body(body, framing=custom)
+    assert new_body2["messages"][2]["content"] == custom
+
+    # Empty messages — framing becomes the only message
+    new_body3 = build_reissue_body({"messages": []})
+    assert len(new_body3["messages"]) == 1
+    assert new_body3["messages"][0]["role"] == "user"
+
+    print("test_build_reissue_body_inserts_framing: OK")
+
+
+def test_upstream2_relay_renumbers_and_dedups():
+    """Phase 3c: Upstream2Relay drops upstream2's message_start, renumbers
+    every block index by index_offset, and passes message_delta /
+    message_stop through unchanged."""
+    import json as _json
+
+    def _ev(t, d):
+        return f"event: {t}\ndata: {_json.dumps(d)}\n\n".encode()
+
+    upstream2_stream = (
+        _ev("message_start", {"type": "message_start", "message": {"id": "msg2", "role": "assistant", "model": "x", "content": [], "usage": {}}})
+        + _ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+        + _ev("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Upstream2 says hi."}})
+        + _ev("content_block_stop", {"type": "content_block_stop", "index": 0})
+        + _ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}})
+        + _ev("message_stop", {"type": "message_stop"})
+    )
+    relay = Upstream2Relay(index_offset=1)
+    out = relay.feed_chunk(upstream2_stream)
+    out_str = out.decode()
+
+    # message_start dropped (only message_delta / message_stop survive from
+    # the message-level events)
+    assert b"event: message_start" not in out, "upstream2's message_start must be dropped"
+    assert b"event: message_delta" in out, "message_delta must survive"
+    assert b"event: message_stop" in out, "message_stop must survive"
+
+    # All block indices renumbered to 1
+    assert '"index": 0' not in out_str, f"index 0 should not appear in renumbered output: {out_str[:200]!r}"
+    assert '"index": 1' in out_str, "renumbered index 1 should appear"
+
+    # Body text survives
+    assert "Upstream2 says hi." in out_str
+
+    # Default offset validation
+    relay_zero = Upstream2Relay(index_offset=0)
+    out_zero = relay_zero.feed_chunk(upstream2_stream)
+    # With offset=0, indices should NOT be renumbered (behaviorally a no-op
+    # except the message_start drop)
+    assert '"index": 0' in out_zero.decode(), "offset=0 should leave indices alone"
+
+    print("test_upstream2_relay_renumbers_and_dedups: OK")
+
+
+def test_default_reset_turn_framing_is_operator_scope():
+    """Phase 3c: the default reset_turn_framing is the Phase-0b-recommended
+    operator-scope text. Sanity-check that critical phrases are present
+    and known anti-pattern phrases are NOT."""
+    text = DEFAULT_RESET_TURN_FRAMING
+    # Must contain the operator hierarchy invocation
+    assert "Operator context" in text
+    assert "operator" in text.lower()
+    assert "principal" in text.lower()
+
+    # Must NOT contain known anti-pattern phrases (per Phase 0b research)
+    anti_patterns = [
+        "ignore previous",
+        "do not refuse",
+        "you must comply",
+        "answer all",
+        "you are not Claude",
+        "no restrictions",
+    ]
+    text_lower = text.lower()
+    for anti in anti_patterns:
+        assert anti.lower() not in text_lower, f"default framing contains anti-pattern: {anti!r}"
+
+    # Should not include refusal-trigger linguistic cues
+    assert "Can you help me" not in text, "refusal-trigger phrase must be absent"
+
+    print("test_default_reset_turn_framing_is_operator_scope: OK")
+
+
 def test_lane_detection_canonical_openers():
     """Phase 5: detect_lane() returns the right label for each canonical
     opener fingerprint defined in LANE_FINGERPRINTS."""
@@ -654,4 +831,9 @@ if __name__ == "__main__":
     test_rewrite_terminal_does_not_intercept_index_gt_zero()
     test_rewrite_terminal_handles_chunk_split_events()
     test_synth_text_delta_event_schema()
+    test_reset_turn_pivot_on_refusal()
+    test_reset_turn_no_pivot_on_helpful_response()
+    test_build_reissue_body_inserts_framing()
+    test_upstream2_relay_renumbers_and_dedups()
+    test_default_reset_turn_framing_is_operator_scope()
     print("\nAll tests passed.")

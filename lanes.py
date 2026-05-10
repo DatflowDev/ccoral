@@ -54,21 +54,24 @@ LANE_FINGERPRINTS: list[tuple[str, str]] = [
     # Main coding agent (every full session). Validated in 11/13 dumps.
     ("You are an interactive agent that helps users with software engineering tasks",
      "main_worker"),
-    # Custom subagent identity used for SDK-CLI Haiku subagents.
+    # Custom subagent dispatched via Task tool with a custom <role>
+    # persona. CC opens the persona block with `<role>\nYou are ...`.
+    # Validated in raw-eni-executor-room-claude-son.json (33K-char system
+    # carrying a custom GSD plan executor persona). The leading `<role>`
+    # is at block-start (no preceding newline in the joined text).
+    # Ranks ABOVE subagent_sdk_default — a custom-persona subagent
+    # carries both the SDK identity AND the <role> overlay, and the
+    # custom-persona label is the more useful classification (lane
+    # policy can treat custom subagents differently from default ones).
+    ("<role>\nYou are",
+     "subagent_custom"),
+    # Default SDK-CLI subagent identity (no custom <role> persona).
     # Validated in raw-eni-executor-room-claude-hai.json,
     # raw-eni-room-claude-hai.json, raw-eni-supervisor-room-claude-hai.json.
     # (Note: this can co-occur with main_worker fingerprint when SDK
     # dispatches a worker; the main_worker substring above wins.)
     ("You are a Claude agent, built on Anthropic's Claude Agent SDK",
      "subagent_sdk_default"),
-    # Custom subagent dispatched via Task tool with a custom <role>
-    # persona. CC opens the persona block with `<role>\nYou are ...`.
-    # Validated in raw-eni-executor-room-claude-son.json (33K-char system
-    # carrying a custom GSD plan executor persona). The leading `<role>`
-    # is at block-start (no preceding newline in the joined text).
-    # Specific to Task subagents that opt into a custom persona.
-    ("<role>\nYou are",
-     "subagent_custom"),
     # Session-title generator (haiku, ~840-char system, fires on session
     # start to label the conversation in CC's UI). Validated in
     # raw-eni-executor-claude-hai.json, raw-red-claude-hai.json.

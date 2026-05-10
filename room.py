@@ -2059,20 +2059,260 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
     return messages, exit_reason
 
 
-def export_conversation(resume: str, output: str = None) -> Path:
-    """Export a saved conversation to clean markdown.
+def _default_export_path(profiles: list, ext: str) -> Path:
+    """Default `<archive>/<date>_<p1>-<p2>.<ext>` for export sinks."""
+    timestamp = datetime.now().strftime("%Y-%m-%d")
+    p1 = profiles[0] if profiles else "unknown"
+    p2 = profiles[1] if len(profiles) > 1 else "unknown"
+    return ROOMS_ARCHIVE / f"{timestamp}_{p1}-{p2}.{ext}"
+
+
+def _export_jsonl(profiles: list, messages: list,
+                  output: str | None) -> Path:
+    """Straight-stream the records to disk, one JSON object per line.
+    Records are passed through verbatim — no `kind` filter — so the
+    operator can post-process if needed.
+    """
+    if output:
+        out_path = Path(output)
+    else:
+        out_path = _default_export_path(profiles, "jsonl")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        for m in messages:
+            f.write(json.dumps(m, ensure_ascii=False) + "\n")
+    return out_path
+
+
+# Cockpit color palette (room_app.tcss). Kept in sync by hand since the
+# Textual stylesheet is the source of truth and HTML doesn't speak tcss.
+# Slot 1 == yellow, slot 2 == cyan, system == muted gray, host == bold
+# white. Matches the ANSI Y/C/W/DIM the legacy cockpit used and the
+# .speaker-1 / .speaker-2 / .system / .host classes in room_app.tcss.
+_HTML_PALETTE = {
+    "bg": "#0d0d10",
+    "fg": "#e6e6e6",
+    "muted": "#7d7d7d",
+    "speaker_1": "#d7c842",   # yellow
+    "speaker_2": "#42c8d7",   # cyan
+    "host": "#ffffff",
+    "system": "#7d7d7d",
+    "warn": "#d77c42",        # orange
+    "border": "#2a2a30",
+}
+
+
+def _html_escape(text: str) -> str:
+    return (text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+
+def _export_html(profiles: list, messages: list, started: str,
+                 output: str | None) -> Path:
+    """Render a single-file standalone HTML transcript with inline CSS.
+
+    No external assets — opens cleanly with `xdg-open` on a workstation
+    with no network. The palette mirrors room_app.tcss so the exported
+    transcript reads the same as the live cockpit.
+
+    `kind == "relay-meta"` records are dropped (same rule as md).
+    Slot color is resolved per-record: prefer record.slot when present;
+    fall back to a name-match against the profiles list.
+    """
+    if output:
+        out_path = Path(output)
+    else:
+        out_path = _default_export_path(profiles, "html")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    p1 = profiles[0] if profiles else "?"
+    p2 = profiles[1] if len(profiles) > 1 else "?"
+    title = f"{p1.title()} × {p2.title()}"
+
+    p = _HTML_PALETTE
+    css = (
+        f"body{{background:{p['bg']};color:{p['fg']};"
+        "font-family:'SF Mono',Menlo,Consolas,monospace;"
+        "max-width:880px;margin:2em auto;padding:0 1.5em;line-height:1.5}}"
+        f"h1{{color:{p['fg']};border-bottom:1px solid {p['border']};"
+        "padding-bottom:.4em}}"
+        f".meta{{color:{p['muted']};margin-bottom:2em}}"
+        ".turn{margin:1.2em 0}"
+        ".name{font-weight:bold;display:block;margin-bottom:.3em}"
+        ".body{white-space:pre-wrap}"
+        f".speaker-1 .name{{color:{p['speaker_1']}}}"
+        f".speaker-2 .name{{color:{p['speaker_2']}}}"
+        f".host .name{{color:{p['host']}}}"
+        f".system .name{{color:{p['system']}}}"
+        f".warn .name{{color:{p['warn']}}}"
+        f"footer{{color:{p['muted']};margin-top:3em;border-top:1px solid {p['border']};"
+        "padding-top:.8em;font-size:.9em}}"
+    )
+
+    body_parts = [
+        "<!doctype html>",
+        '<html lang="en"><head><meta charset="utf-8">',
+        f"<title>{_html_escape(title)}</title>",
+        f"<style>{css}</style>",
+        "</head><body>",
+        f"<h1>{_html_escape(title)}</h1>",
+    ]
+    if started:
+        body_parts.append(f'<div class="meta">{_html_escape(started)}</div>')
+
+    p1_low = (p1 or "").lower()
+    p2_low = (p2 or "").lower()
+    for m in messages:
+        if m.get("kind") == "relay-meta":
+            continue
+        name = m.get("name", "UNKNOWN")
+        text = (m.get("text") or "").strip()
+        if not text:
+            continue
+        # Resolve slot color. Prefer record.slot (Phase 8 stamp);
+        # fall back to a name-match so legacy archives still color.
+        slot = m.get("slot")
+        css_class = "host"
+        if slot == 1:
+            css_class = "speaker-1"
+        elif slot == 2:
+            css_class = "speaker-2"
+        else:
+            nlow = name.lower()
+            if nlow.startswith(p1_low) and p1_low:
+                css_class = "speaker-1"
+            elif nlow.startswith(p2_low) and p2_low:
+                css_class = "speaker-2"
+            elif name == "SYSTEM":
+                css_class = "system"
+        body_parts.append(
+            f'<div class="turn {css_class}">'
+            f'<span class="name">{_html_escape(name)}</span>'
+            f'<div class="body">{_html_escape(text)}</div>'
+            f'</div>'
+        )
+
+    body_parts.append(
+        f'<footer>Recorded by ccoral room — {_html_escape(p1)} × {_html_escape(p2)}</footer>'
+    )
+    body_parts.append("</body></html>")
+    out_path.write_text("\n".join(body_parts), encoding="utf-8")
+    return out_path
+
+
+def delete_room(room_id: str, *, yes: bool = False,
+                base: "Path | None" = None,
+                stream=None, prompt=None) -> bool:
+    """Remove ~/.ccoral/rooms/<id>/ recursively.
+
+    Without `yes`, prints a confirmation prompt and reads y/N from
+    stdin (or `prompt`, when supplied — used by tests). Returns True
+    on delete, False on miss / refusal. `<id>` accepts "last" or any
+    prefix matched by `_resolve_room_id`.
+    """
+    if stream is None:
+        stream = sys.stdout
+    target = _resolve_room_id(room_id, base=base)
+    if target is None:
+        stream.write(f"room not found: {room_id}\n")
+        return False
+
+    if not yes:
+        # Confirmation gate. Honors a caller-provided `prompt` for
+        # tests so we don't tie a unit test to interactive stdin.
+        if prompt is None:
+            answer = input(f"Delete room {target.name}? [y/N] ").strip().lower()
+        else:
+            answer = (prompt(f"Delete room {target.name}? [y/N] ") or "").strip().lower()
+        if answer not in ("y", "yes"):
+            stream.write("aborted.\n")
+            return False
+
+    shutil.rmtree(target)
+    stream.write(f"deleted: {target.name}\n")
+    return True
+
+
+def rename_room(room_id: str, new_id: str, *,
+                base: "Path | None" = None, stream=None) -> bool:
+    """Move ~/.ccoral/rooms/<id>/ -> ~/.ccoral/rooms/<new_id>/.
+
+    Errors when the source is missing or the target already exists.
+    Updates the `id` / `room_id` fields inside meta.yaml so a later
+    `room ls` shows the new identity. Returns True on success.
+    """
+    if stream is None:
+        stream = sys.stdout
+    src = _resolve_room_id(room_id, base=base)
+    if src is None:
+        stream.write(f"room not found: {room_id}\n")
+        return False
+
+    base_dir = base if base is not None else (Path.home() / ".ccoral" / "rooms")
+    # Allow nested archive ids ("archived/cool-talk") — make parents.
+    dst = base_dir / new_id
+    if dst.exists():
+        stream.write(f"target exists: {dst}\n")
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+
+    # Refresh meta.yaml so the in-file id matches the new dir name.
+    meta_path = dst / "meta.yaml"
+    if meta_path.exists():
+        try:
+            with open(meta_path) as f:
+                meta = yaml.safe_load(f) or {}
+            meta["room_id"] = new_id
+            with open(meta_path, "w") as f:
+                yaml.dump(meta, f, default_flow_style=False, allow_unicode=True)
+        except Exception:
+            # Don't unwind the move if the meta rewrite fails — the
+            # rename is the load-bearing operation. Phase 11's watcher
+            # falls back to dir name when room_id is stale.
+            pass
+    stream.write(f"renamed: {src.name} -> {new_id}\n")
+    return True
+
+
+def export_conversation(resume: str, output: str = None,
+                        format: str = "md") -> Path:
+    """Export a saved conversation.
+
+    Phase 5: `format` selects the renderer:
+      - "md"    — clean markdown (legacy default; relay-meta filtered)
+      - "jsonl" — straight stream of records, one per line, verbatim
+      - "html"  — single-file standalone with the cockpit palette,
+                  inline CSS, no external assets
+
+    Records with `kind == "relay-meta"` are filtered out of `md` and
+    `html` (interjections + SYSTEM backpressure notes are noise in
+    a published transcript). `jsonl` keeps everything — operators
+    consuming the JSONL can filter on `kind` themselves.
 
     Args:
-        resume: "last", a filename, or a path to a JSON archive.
-        output: Optional output path. Defaults to same dir as source, .md extension.
+        resume: "last", a room id, a filename, or a path to a JSON archive.
+        output: Optional output path. Defaults to ROOMS_ARCHIVE/<timestamp>_<p1>-<p2>.<ext>.
+        format: "md" (default), "jsonl", or "html".
 
     Returns:
-        Path to the exported markdown file.
+        Path to the exported file.
     """
+    if format not in ("md", "jsonl", "html"):
+        print(f"{Y}unknown export format: {format}{NC}")
+        sys.exit(1)
+
     data = load_conversation(resume)
     profiles = data["profiles"]
     messages = data.get("messages", [])
     started = data.get("started", "")
+
+    if format == "jsonl":
+        return _export_jsonl(profiles, messages, output)
+    if format == "html":
+        return _export_html(profiles, messages, started, output)
+    # default md path falls through to the legacy renderer below.
 
     if not messages:
         print(f"{Y}No messages to export.{NC}")
@@ -2096,6 +2336,13 @@ def export_conversation(resume: str, output: str = None) -> Path:
     lines.append("")
 
     for msg in messages:
+        # Phase 5: drop relay-meta lines (host interjections, SYSTEM
+        # backpressure notes) from the published transcript. The
+        # structured `kind` marker (Phase 2) is the source of truth;
+        # no string-match heuristics. Operators who want the full
+        # stream use `--format jsonl` and filter themselves.
+        if msg.get("kind") == "relay-meta":
+            continue
         name = msg.get("name", "UNKNOWN")
         text = msg.get("text", "").strip()
 
@@ -2109,14 +2356,6 @@ def export_conversation(resume: str, output: str = None) -> Path:
                 continue  # Skip machine-generated JSON
             except json.JSONDecodeError:
                 pass
-
-        # Phase 2: the old string-match export filter that lived here is
-        # gone. It existed to drop transcript lines where a model echoed
-        # our tmpfile-read plumbing back at us — the leak is gone
-        # (paste-buffer relay) and so is the filter. Task 2.4 adds a
-        # structured `kind: "relay-meta"` marker so meta lines
-        # (backpressure SYSTEM messages, [CASSIUS] interjections) can be
-        # filtered without string matching.
 
         # Format the speaker. The `name` field already carries the right
         # display label — host messages are written with the resolved

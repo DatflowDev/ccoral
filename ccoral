@@ -349,6 +349,11 @@ def _parse_room_args(args: list) -> dict:
         "resume": None,
         "export": None,
         "export_output": None,
+        "export_format": None,
+        "delete_id": None,
+        "rename_from": None,
+        "rename_to": None,
+        "yes": False,
         "legacy_cockpit": False,
         "ls": False,
         "show_id": None,
@@ -402,6 +407,16 @@ def _parse_room_args(args: list) -> dict:
         elif a in ("--output", "-o"):
             out["export_output"] = _need_value("--output", i + 1)
             i += 2
+        elif a == "--format":
+            fmt = _need_value("--format", i + 1)
+            if fmt not in ("md", "jsonl", "html"):
+                print(f"{R}--format must be one of md|jsonl|html{NC}")
+                sys.exit(1)
+            out["export_format"] = fmt
+            i += 2
+        elif a == "--yes":
+            out["yes"] = True
+            i += 1
         elif a == "--user":
             out["user"] = _need_value("--user", i + 1)
             i += 2
@@ -464,6 +479,15 @@ def _parse_room_args(args: list) -> dict:
             # `ccoral room show <id>` — page transcript.
             out["show_id"] = _need_value("show", i + 1)
             i += 2
+        elif a == "delete":
+            # `ccoral room delete <id> [--yes]`
+            out["delete_id"] = _need_value("delete", i + 1)
+            i += 2
+        elif a == "rename":
+            # `ccoral room rename <id> <new-id>`
+            out["rename_from"] = _need_value("rename", i + 1)
+            out["rename_to"] = _need_value("rename", i + 2)
+            i += 3
         elif len(out["profiles"]) < 2:
             out["profiles"].append(a)
             i += 1
@@ -537,9 +561,24 @@ def cmd_room(args: list):
         room_show(parsed["show_id"])
         return
 
+    # `ccoral room delete <id> [--yes]`
+    if parsed["delete_id"]:
+        from room import delete_room
+        ok = delete_room(parsed["delete_id"], yes=parsed["yes"])
+        sys.exit(0 if ok else 1)
+
+    # `ccoral room rename <id> <new-id>`
+    if parsed["rename_from"]:
+        from room import rename_room
+        ok = rename_room(parsed["rename_from"], parsed["rename_to"])
+        sys.exit(0 if ok else 1)
+
     if parsed["export"]:
-        path = export_conversation(parsed["export"], output=parsed["export_output"])
-        print(f"{G}Exported: {path}{NC}")
+        fmt = parsed["export_format"] or "md"
+        path = export_conversation(
+            parsed["export"], output=parsed["export_output"], format=fmt,
+        )
+        print(f"{G}Exported ({fmt}): {path}{NC}")
         return
 
     config = _build_room_config(parsed)
@@ -566,10 +605,12 @@ def cmd_room(args: list):
 
     if len(parsed["profiles"]) < 2:
         print(f"{R}Usage: ccoral room <profile1> <profile2> [topic]{NC}")
-        print(f"       ccoral room --resume last")
-        print(f"       ccoral room --export <last|filename> [--output path]")
+        print(f"       ccoral room --resume last [--resume-tail N]")
+        print(f"       ccoral room --export <last|id|filename> [--format md|jsonl|html] [--output path]")
         print(f"       ccoral room ls")
         print(f"       ccoral room show <id|last>")
+        print(f"       ccoral room delete <id|last> [--yes]")
+        print(f"       ccoral room rename <id|last> <new-id>")
         sys.exit(1)
 
     run_room(

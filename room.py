@@ -261,6 +261,65 @@ def send_to_pane(session: str, message: str):
 _TMUX_BUFFER_CHUNK = 256 * 1024
 
 
+def _envelope_iso8601_utc() -> str:
+    """UTC ISO-8601 with millisecond precision and trailing Z. Matches the
+    server-side `_iso8601_utc_now` shape so envelope timestamps and turn-
+    record `ts` line up byte-for-byte.
+    """
+    from datetime import timezone as _tz
+    return datetime.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def build_relay_envelope(
+    *,
+    sender: str,
+    recipient: str,
+    kind: str,
+    ts: str,
+    stop_reason: str | None = None,
+    reason: str | None = None,
+    text: str,
+) -> str:
+    """Build the structured header-line envelope used between rooms.
+
+    Shape:
+      Turn relay (KIND=turn):
+        [FROM=<sender> TO=<recipient> KIND=turn TS=<ts> STOP=<stop_reason>]
+        <body, multi-line preserved verbatim>
+
+      Cockpit interject (KIND=interject):
+        [FROM=<sender> TO=<recipient or BOTH> KIND=interject TS=<ts>]
+        <body>
+
+      System (KIND=system):
+        [FROM=SYSTEM TO=<target> KIND=system TS=<ts> REASON=<short_slug>]
+        <body>
+
+    The header line is a parseable convention for the orchestrator export
+    path and a natural read for the receiving Claude — it is NOT a tool-use
+    instruction. The model knows it's the addressed party because that's
+    what its profile inject and seed told it; the FROM/TO header is just a
+    courtesy label, like a memo header. No "respond as TO" instruction is
+    appended anywhere — that would push toward roleplay framing we don't
+    want.
+
+    Body content is pasted verbatim. Newlines within `text` are preserved.
+    The chunked `relay_via_paste_buffer` helper splits at byte boundaries
+    that don't need to respect the header — the receiving Claude reads the
+    whole pasted block as one message.
+    """
+    fields = [f"FROM={sender}", f"TO={recipient}", f"KIND={kind}", f"TS={ts}"]
+    if kind == "turn":
+        # STOP is mandatory shape-wise on turns; if absent (theoretical —
+        # the server always sets one) we emit "unknown" so the parser path
+        # never has to special-case missing fields.
+        fields.append(f"STOP={stop_reason or 'unknown'}")
+    elif kind == "system":
+        fields.append(f"REASON={reason or 'unspecified'}")
+    header = "[" + " ".join(fields) + "]"
+    return f"{header}\n{text}"
+
+
 def relay_via_paste_buffer(session: str, text: str, buffer_name: str) -> None:
     """Relay a multi-line message into a tmux pane via load-buffer + paste-buffer.
 
@@ -582,10 +641,15 @@ class TurnArbiter:
         decisions.append((self.RELAY, text, other))
 
         # Backpressure trip: speaker just produced their Nth solo turn.
+        # The relay site wraps `sys_text` in the structured envelope; we
+        # return the bare body + a reason slug so the arbiter stays format-
+        # agnostic.
         if self.consecutive_solo[speaker] >= self.cap:
-            sys_text = f"[SYSTEM] {other.upper()} hasn't replied yet — pausing."
+            sys_text = f"{other.upper()} hasn't replied yet — pausing."
             self.stalled_until[speaker] = time.monotonic() + self.timeout
-            decisions.append((self.BACKPRESSURE, sys_text, speaker))
+            decisions.append((
+                self.BACKPRESSURE, sys_text, speaker, "backpressure_stall",
+            ))
 
         return decisions
 
@@ -708,14 +772,24 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
 
         # Send initial topic to profile1 only — profile2 hears it through the relay
         if topic and not prior_messages:
-            initial_msg = f"[{USER_NAME}] {topic}"
+            ts = _envelope_iso8601_utc()
+            initial_msg = build_relay_envelope(
+                sender=USER_NAME,
+                recipient=get_display_name(profile1),
+                kind="interject",
+                ts=ts,
+                text=topic,
+            )
             send_to_pane(panes[profile1], initial_msg)
             messages.append({
                 "name": USER_NAME,
                 "text": topic,
                 "time": datetime.now().isoformat(),
+                "from": USER_NAME,
+                "to": get_display_name(profile1),
                 # Initial host seed — meta from the conversation's POV.
                 "kind": "relay-meta",
+                "envelope_kind": "interject",
             })
             room_control.render_transcript_line(USER_NAME, topic, W)
 
@@ -746,15 +820,26 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
             Tagged `relay-meta` so export filters can drop interjections
             cleanly without resorting to string-match heuristics.
             """
+            ts = _envelope_iso8601_utc()
+            envelope = build_relay_envelope(
+                sender=USER_NAME,
+                recipient="BOTH",
+                kind="interject",
+                ts=ts,
+                text=text,
+            )
             messages.append({
                 "name": USER_NAME,
                 "text": text,
                 "time": datetime.now().isoformat(),
+                "from": USER_NAME,
+                "to": "BOTH",
                 "kind": "relay-meta",
+                "envelope_kind": "interject",
             })
             room_control.render_transcript_line(USER_NAME, text, W)
-            send_to_pane(panes[profile1], f"[{USER_NAME}] {text}")
-            send_to_pane(panes[profile2], f"[{USER_NAME}] {text}")
+            send_to_pane(panes[profile1], envelope)
+            send_to_pane(panes[profile2], envelope)
 
         def _inject_to(target: str, text: str) -> None:
             sess = pane_for_profile(panes, target)
@@ -763,17 +848,27 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                     "ROOM", f"unknown target: {target}", DIM,
                 )
                 return
+            ts = _envelope_iso8601_utc()
+            envelope = build_relay_envelope(
+                sender=USER_NAME,
+                recipient=get_display_name(target),
+                kind="interject",
+                ts=ts,
+                text=text,
+            )
             messages.append({
                 "name": USER_NAME,
                 "text": text,
                 "time": datetime.now().isoformat(),
+                "from": USER_NAME,
                 "to": target,
                 "kind": "relay-meta",
+                "envelope_kind": "interject",
             })
             room_control.render_transcript_line(
                 USER_NAME, f"(→ {target}) {text}", W,
             )
-            send_to_pane(sess, f"[{USER_NAME}] {text}")
+            send_to_pane(sess, envelope)
 
         def _open_transcript_pager() -> None:
             """Spawn `less -R` on the live transcript file.
@@ -871,8 +966,13 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
 
             display = get_display_name(speaker)
             color = colors_map[speaker]
+            other = profile2 if speaker == profile1 else profile1
+            recipient_display = get_display_name(other)
 
-            # Log + render the turn into the cockpit transcript.
+            # Log + render the turn into the cockpit transcript. The
+            # `from`/`to`/`envelope_kind` fields make Phase 5's export path
+            # parseable without re-regexing the body — it just reads the
+            # structured fields directly.
             messages.append({
                 "name": display,
                 "text": text,
@@ -880,6 +980,9 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 "stop_reason": record.get("stop_reason"),
                 "request_id": record.get("request_id"),
                 "kind": "turn",
+                "from": display,
+                "to": recipient_display,
+                "envelope_kind": "turn",
             })
             room_control.render_transcript_line(display, text, color)
 
@@ -888,6 +991,7 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 return
 
             # Hand to the arbiter and execute its decisions in order.
+            stop_reason = record.get("stop_reason")
             for decision in arbiter.on_turn_record(speaker, text):
                 kind = decision[0]
                 if kind == TurnArbiter.RELAY:
@@ -895,24 +999,42 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                     target_session = panes[target]
                     turn_seq += 1
                     buffer_name = f"ccoral-room-{room_id}-{turn_seq}"
-                    formatted = f"[{display}] {relay_text}"
+                    envelope = build_relay_envelope(
+                        sender=display,
+                        recipient=get_display_name(target),
+                        kind="turn",
+                        ts=_envelope_iso8601_utc(),
+                        stop_reason=stop_reason,
+                        text=relay_text,
+                    )
                     relay_via_paste_buffer(
-                        target_session, formatted, buffer_name,
+                        target_session, envelope, buffer_name,
                     )
                 elif kind == TurnArbiter.BACKPRESSURE:
-                    _, sys_text, who = decision
+                    _, sys_text, who, sys_reason = decision
                     sys_session = panes[who]
                     turn_seq += 1
                     buffer_name = f"ccoral-room-{room_id}-{turn_seq}"
+                    envelope = build_relay_envelope(
+                        sender="SYSTEM",
+                        recipient=get_display_name(who),
+                        kind="system",
+                        ts=_envelope_iso8601_utc(),
+                        reason=sys_reason,
+                        text=sys_text,
+                    )
                     relay_via_paste_buffer(
-                        sys_session, sys_text, buffer_name,
+                        sys_session, envelope, buffer_name,
                     )
                     messages.append({
                         "name": "SYSTEM",
                         "text": sys_text,
                         "time": datetime.now().isoformat(),
+                        "from": "SYSTEM",
                         "to": who,
+                        "reason": sys_reason,
                         "kind": "relay-meta",
+                        "envelope_kind": "system",
                     })
                     room_control.render_transcript_line("SYSTEM", sys_text, DIM)
 

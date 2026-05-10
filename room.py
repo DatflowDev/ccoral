@@ -76,10 +76,11 @@ RELAY_SELECT_TIMEOUT = 0.25
 class RoomConfig:
     """Resolved-at-start configuration for one `ccoral room` invocation.
 
-    Replaces the module-level USER_NAME / BASE_PORT / TMUX_SESSION constants
-    of Phases 1+2. Populated by the CLI dispatcher in `ccoral`; threaded
-    through start_proxies/setup_tmux/relay_loop so two rooms can run
-    side-by-side on different ports without env-var gymnastics.
+    Replaces the (now-deleted) module-level USER_NAME / BASE_PORT /
+    TMUX_SESSION / BACKPRESSURE_* constants of Phases 1+2. Populated by
+    the CLI dispatcher in `ccoral`; threaded through
+    start_proxies/setup_tmux/relay_loop so two rooms can run side-by-side
+    on different ports without env-var gymnastics.
 
     Defaults preserve pre-Phase-3 behavior exactly: `ccoral room blank blank`
     with no flags resolves to user=CASSIUS, port=8090, tmux session prefix
@@ -106,16 +107,11 @@ class RoomConfig:
         return f"{self.tmux_session_prefix}-{profile}"
 
 
-# Backward-compat aliases — pre-Phase-3 call sites still reference these
-# module-level names. Sourced from RoomConfig() defaults so the dataclass is
-# the single source of truth. Removed once Phase 3 threads RoomConfig through
-# start_proxies / setup_tmux / relay_loop / cmd_room.
-_DEFAULT_ROOM_CONFIG = RoomConfig()
-USER_NAME = _DEFAULT_ROOM_CONFIG.user_name
-BASE_PORT = _DEFAULT_ROOM_CONFIG.base_port
-TMUX_SESSION = _DEFAULT_ROOM_CONFIG.tmux_session_prefix
-BACKPRESSURE_TURNS_DEFAULT = _DEFAULT_ROOM_CONFIG.backpressure_turns
-BACKPRESSURE_TIMEOUT_DEFAULT = _DEFAULT_ROOM_CONFIG.backpressure_timeout_s
+# Phase 3 C3: alias shim retired. The module-level USER_NAME / BASE_PORT /
+# TMUX_SESSION / BACKPRESSURE_* names lived here as a transitional
+# courtesy while C1 threaded RoomConfig through every call site. They
+# are now gone — RoomConfig is the single source of truth. Operators who
+# need defaults read them from `RoomConfig()` directly.
 
 
 def get_display_name(profile_name: str) -> str:
@@ -181,7 +177,8 @@ _LOAD_PROFILE_INTERNAL_KEYS = {"_path", "_name"}
 _TEMP_PROFILE_OVERRIDES = {"name", "description", "inject", "room_addendum"}
 
 
-def create_room_profiles(profile1: str, profile2: str) -> dict:
+def create_room_profiles(profile1: str, profile2: str,
+                         user_name: str | None = None) -> dict:
     """Create temporary profiles with room relay instructions baked into inject.
 
     Phase 4: the hardcoded English room-instructions block is gone.
@@ -203,6 +200,9 @@ def create_room_profiles(profile1: str, profile2: str) -> dict:
     ROOM_DIR.mkdir(parents=True, exist_ok=True)
     TEMP_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 
+    if user_name is None:
+        user_name = RoomConfig().user_name
+
     temp_names = {}
 
     for self_name, other_name in [(profile1, profile2), (profile2, profile1)]:
@@ -216,7 +216,7 @@ def create_room_profiles(profile1: str, profile2: str) -> dict:
         other_display = get_display_name(other_name)
 
         addendum = _resolve_room_addendum(
-            base, other_display=other_display, user_name=USER_NAME,
+            base, other_display=other_display, user_name=user_name,
         )
         base_inject = base.get("inject", "") or ""
         if addendum:
@@ -752,8 +752,8 @@ class TurnArbiter:
         self,
         profile1: str,
         profile2: str,
-        backpressure_turns: int = BACKPRESSURE_TURNS_DEFAULT,
-        backpressure_timeout: float = BACKPRESSURE_TIMEOUT_DEFAULT,
+        backpressure_turns: int = 2,
+        backpressure_timeout: float = 60.0,
     ):
         self.profile1 = profile1
         self.profile2 = profile2
@@ -1600,11 +1600,11 @@ def export_conversation(resume: str, output: str = None) -> Path:
         # (backpressure SYSTEM messages, [CASSIUS] interjections) can be
         # filtered without string matching.
 
-        # Format the speaker
-        if name == USER_NAME:
-            lines.append(f"**{USER_NAME}:**")
-        else:
-            lines.append(f"**{name}:**")
+        # Format the speaker. The `name` field already carries the right
+        # display label — host messages are written with the resolved
+        # user_name (RoomConfig.user_name), so we don't need a special
+        # branch on it. Phase 3 dropped the USER_NAME module constant.
+        lines.append(f"**{name}:**")
 
         lines.append("")
         lines.append(text)
@@ -1674,7 +1674,9 @@ def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None
     ROOM_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"{DIM}Creating room profiles...{NC}")
-    room_profiles = create_room_profiles(profile1, profile2)
+    room_profiles = create_room_profiles(
+        profile1, profile2, user_name=config.user_name,
+    )
 
     # Phase 2 + Phase 8: per-slot turn-record channel. Created BEFORE
     # proxy launch so the FIFO node exists when the proxy first tries to

@@ -30,11 +30,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from room import (  # noqa: E402
     DEFAULT_ROOM_ADDENDUM,
+    RoomConfig,
     TEMP_PROFILES_DIR,
-    USER_NAME,
     create_room_profiles,
     get_display_name,
 )
+
+# Phase 3 C3: USER_NAME module-level constant was retired. Source the
+# default user name from RoomConfig directly so the assertion matches
+# what create_room_profiles uses internally (also default).
+USER_NAME = RoomConfig().user_name
 from profiles import USER_PROFILES_DIR  # noqa: E402
 
 

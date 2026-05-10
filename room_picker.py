@@ -25,15 +25,19 @@ Layout (PickerScreen):
     columns are re-populated with matching profile entries.
   - Footer (BINDINGS render here via show=True).
 
-C1 lands the picker shell + filter; the same-profile guard surfaces a
-description warning and refuses to proceed. C2 will replace that with the
-ConfirmScreen modal and land the optional TopicScreen step. Until C2,
-distinct picks resolve immediately with topic=None.
+Same-profile guard: pressing Enter when both columns picked the same name
+pushes a `ConfirmScreen` (ModalScreen). 'y' resolves with `(name, name)`;
+'n' / Esc returns to the picker. After confirmation (or distinct picks),
+a `TopicScreen` (ModalScreen) prompts for an optional topic; Enter on
+empty resolves with topic=None.
 
 References (verified against installed textual==8.2.5 — see Phase 9
 notes in room_app.py and the introspection log in this phase's commit):
 
-  - Screen:                 https://textual.textualize.io/api/screen/
+  - Screen / ModalScreen:   https://textual.textualize.io/api/screen/
+  - Screen.dismiss(value):  same page; returns AwaitComplete.
+  - App.push_screen(screen, callback):
+                            https://textual.textualize.io/guide/screens/
   - OptionList + Option:    https://textual.textualize.io/widgets/option_list
   - Input.Changed:          https://textual.textualize.io/widgets/input
   - Binding(show=True):     https://textual.textualize.io/guide/input
@@ -46,12 +50,77 @@ from typing import Callable
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal
-from textual.screen import Screen
+from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen, Screen
 from textual.widgets import Footer, Header, Input, Label, OptionList
 from textual.widgets.option_list import Option
 
 import profiles
+
+
+# ---------------------------------------------------------------------------
+# Modal screens — defined first so PickerScreen can reference them.
+# ---------------------------------------------------------------------------
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    """Modal yes/no prompt for the same-profile-twice case.
+
+    Result: True for 'y', False for 'n' / Esc.
+    """
+
+    BINDINGS = [
+        Binding("y", "yes", "Yes"),
+        Binding("n,escape", "no", "No"),
+    ]
+
+    def __init__(self, profile_name: str) -> None:
+        super().__init__()
+        self._profile_name = profile_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(
+                f"Run two instances of {self._profile_name!r}? [y/N]",
+                id="confirm-prompt",
+            )
+
+    def action_yes(self) -> None:
+        self.dismiss(True)
+
+    def action_no(self) -> None:
+        self.dismiss(False)
+
+
+class TopicScreen(ModalScreen[str | None]):
+    """Modal one-shot input for an optional topic.
+
+    Result: stripped string, or None if empty / cancelled.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, initial: str | None = None) -> None:
+        super().__init__()
+        self._initial = initial or ""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("Topic (optional, Enter to skip):", id="topic-prompt")
+            yield Input(value=self._initial, id="topic-input")
+
+    def on_mount(self) -> None:
+        self.query_one("#topic-input", Input).focus()
+
+    @on(Input.Submitted, "#topic-input")
+    def on_submit(self, event: Input.Submitted) -> None:
+        value = (event.value or "").strip()
+        self.dismiss(value or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +205,17 @@ class PickerScreen(Screen):
         desc = self._descriptions.get(name, "")
         self.query_one("#description", Label).update(desc)
 
+    @on(OptionList.OptionSelected)
+    def on_option_selected(self, event: OptionList.OptionSelected) -> None:
+        """OptionList consumes Enter to fire OptionSelected before the
+        screen-level Binding sees it. Funnel that into action_confirm so
+        Enter while a column is focused launches the room (or the same-
+        profile confirm modal). The Binding still surfaces in the Footer
+        and is reachable when no OptionList has focus.
+        """
+        event.stop()
+        self.action_confirm()
+
     @on(Input.Changed, "#filter")
     def on_filter_changed(self, event: Input.Changed) -> None:
         self._refresh_columns(event.value)
@@ -189,10 +269,9 @@ class PickerScreen(Screen):
     def action_confirm(self) -> None:
         """Enter — read both columns' highlighted options and resolve.
 
-        C1: distinct picks resolve immediately with topic=None. Same-name
-        picks are blocked with a description-bar warning and require the
-        operator to change one column before retrying. C2 replaces that
-        block with a ConfirmScreen modal and adds the optional topic step.
+        Same-profile picks push ConfirmScreen; on yes (or distinct picks)
+        we push TopicScreen for the optional topic step. The final tuple
+        is handed to the App via `_finish`.
         """
         col1 = self.query_one("#col1", OptionList)
         col2 = self.query_one("#col2", OptionList)
@@ -207,16 +286,19 @@ class PickerScreen(Screen):
             return
 
         if p1 == p2:
-            # C1 placeholder behaviour — a same-profile pick is refused
-            # here so we never accidentally resolve to (name, name) before
-            # the C2 confirm modal lands.
-            self.query_one("#description", Label).update(
-                f"Same profile in both columns ({p1!r}). Pick distinct "
-                "profiles, or wait for the same-profile confirm modal.",
-            )
+            def _after_confirm(result: bool | None) -> None:
+                if result:
+                    self._prompt_topic(p1, p2)
+                # else: cancelled — stay on picker.
+            self.app.push_screen(ConfirmScreen(p1), _after_confirm)
             return
 
-        self._finish(p1, p2, self._initial_topic)
+        self._prompt_topic(p1, p2)
+
+    def _prompt_topic(self, p1: str, p2: str) -> None:
+        def _after_topic(topic: str | None) -> None:
+            self._finish(p1, p2, topic)
+        self.app.push_screen(TopicScreen(self._initial_topic), _after_topic)
 
     @staticmethod
     def _highlighted_id(col: OptionList) -> str | None:

@@ -27,6 +27,7 @@ import shutil
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 # Ensure imports from ccoral dir
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -254,7 +255,8 @@ def cleanup_room_profiles(profile1: str, profile2: str):
             pass
 
 
-def start_proxies(room_profiles: dict, channels: dict | None = None) -> list:
+def start_proxies(room_profiles: dict, channels: dict | None = None,
+                  config: "RoomConfig | None" = None) -> list:
     """Start two CCORAL proxy instances with room profiles.
 
     `channels`, when provided, maps slot int (1 or 2) -> (path, kind). The
@@ -268,7 +270,13 @@ def start_proxies(room_profiles: dict, channels: dict | None = None) -> list:
     derived from enumeration order over `room_profiles` — the dict
     insertion order matches (profile1, profile2) at the run_room call
     site.
+
+    Phase 3: `config` carries the resolved RoomConfig (in particular
+    `base_port`). When None, a defaulted RoomConfig() is used so legacy
+    callers and tests still work without threading a config explicitly.
     """
+    if config is None:
+        config = RoomConfig()
     server_path = SCRIPT_DIR / "server.py"
     procs = []
 
@@ -280,7 +288,7 @@ def start_proxies(room_profiles: dict, channels: dict | None = None) -> list:
 
     for i, (base_name, room_name) in enumerate(room_profiles.items()):
         slot = i + 1
-        port = BASE_PORT + i
+        port = config.base_port + i
         env = os.environ.copy()
         env["CCORAL_PORT"] = str(port)
         env["CCORAL_PROFILE"] = room_name
@@ -342,14 +350,21 @@ def stop_proxies(procs: list):
             pass
 
 
-def setup_tmux(profile1: str, profile2: str) -> bool:
-    """Create two separate tmux sessions, one per Claude instance."""
+def setup_tmux(profile1: str, profile2: str,
+               config: "RoomConfig | None" = None) -> bool:
+    """Create two separate tmux sessions, one per Claude instance.
 
-    p1_session = f"room-{profile1}"
-    p2_session = f"room-{profile2}"
+    Phase 3: tmux session names and ports come from the RoomConfig so two
+    rooms can run side-by-side without colliding on session names or ports.
+    """
+    if config is None:
+        config = RoomConfig()
 
-    port1 = BASE_PORT
-    port2 = BASE_PORT + 1
+    p1_session = config.session_for(profile1)
+    p2_session = config.session_for(profile2)
+
+    port1 = config.base_port
+    port2 = config.base_port + 1
     cmd1 = f"ANTHROPIC_BASE_URL=http://127.0.0.1:{port1} claude --dangerously-skip-permissions"
     cmd2 = f"ANTHROPIC_BASE_URL=http://127.0.0.1:{port2} claude --dangerously-skip-permissions"
 
@@ -871,7 +886,9 @@ def _setup_turn_channel(slot: int, profile_name: str) -> tuple[Path, str]:
 def relay_loop(profile1: str, profile2: str, topic: str = None,
                prior_messages: list = None,
                channels: dict | None = None,
-               legacy_cockpit: bool = False):
+               legacy_cockpit: bool = False,
+               config: "RoomConfig | None" = None,
+               on_turn_committed: "Callable[[dict], None] | None" = None):
     """Drive the room: consume turn records from each proxy's channel,
     feed them to a `TurnArbiter`, and execute its decisions (paste-buffer
     relay, system backpressure messages, stalls).
@@ -884,12 +901,35 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
       0.0 = top-left (profile1 Claude)
       0.1 = bottom-left (control)
       0.2 = right (profile2 Claude)
+
+    Phase 3: `config` carries the resolved RoomConfig (session prefix,
+    user name, backpressure knobs, turn limit, seed1/seed2). When None
+    we build a defaulted RoomConfig() — preserves pre-Phase-3 behavior
+    for tests and standalone callers.
+
+    `on_turn_committed`, when supplied, is invoked for every message
+    appended to the in-memory transcript. C4 wires this to the per-room
+    `transcript.jsonl` append. Exceptions raised by the callback are
+    swallowed so a transient I/O failure on the archive side never wedges
+    the relay.
     """
+    if config is None:
+        config = RoomConfig()
+    user_name = config.user_name
     # Per-run room id used to namespace tmux paste buffers so two rooms
     # running concurrently don't trample each other's relay payloads.
-    # Phase 3 replaces this synthetic id with the real `RoomConfig.room_id`.
-    room_id = f"{profile1}-{profile2}-{int(time.time())}"
+    # Phase 3: prefer the RoomConfig.room_id when set (run_room stamps it
+    # at start so the per-room state dir and the paste-buffer namespace
+    # share an identifier); fall back to the legacy synthetic id for
+    # standalone callers that don't go through run_room.
+    room_id = config.room_id or f"{profile1}-{profile2}-{int(time.time())}"
     turn_seq = 0
+    # Turn-limit accounting (Phase 3 task 3.1). Counts speaker turns —
+    # i.e. completed-turn records the relay actually committed to the
+    # transcript. Initial seeds and SYSTEM lines do NOT count. None means
+    # unlimited (legacy behavior).
+    turns_committed = 0
+    exit_reason = "clean"
 
     # Phase 9 C5: --legacy-cockpit fallback. Rebind `room_control` to the
     # bespoke pre-Phase-9 module (now room_control_legacy.py) so every
@@ -927,9 +967,11 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
     # and stays that way for the life of the room. Speaker color +
     # display come from the slot, not the profile name, so a
     # duplicate-profile run (`room blank blank`) still routes correctly.
+    # Phase 3: session names come from RoomConfig.session_for so two
+    # rooms with different `tmux_session_prefix` values don't collide.
     panes = {
-        1: f"room-{profile1}",
-        2: f"room-{profile2}",
+        1: config.session_for(profile1),
+        2: config.session_for(profile2),
     }
     # Phase 8 default display rule. Distinct profiles → bare uppercased
     # name; same profile in both slots → suffixed `<NAME>#1` / `<NAME>#2`.
@@ -964,10 +1006,28 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
 
     # Arbiter — strict turn order + backpressure. Still profile-keyed
     # internally; the relay-side translation lives in _handle_turn_record.
-    arbiter = TurnArbiter(profile1, profile2)
+    # Phase 3: backpressure knobs come from RoomConfig.
+    arbiter = TurnArbiter(
+        profile1, profile2,
+        backpressure_turns=config.backpressure_turns,
+        backpressure_timeout=config.backpressure_timeout_s,
+    )
 
     # Give Claude sessions time to start up
-    room_control.set_user(USER_NAME)
+    room_control.set_user(user_name)
+
+    # Helper: append to the in-memory transcript AND fan out to the
+    # per-room JSONL appender, if one was provided. Defined at the
+    # outer scope so every closure below can call it without smuggling
+    # the callback through a parameter.
+    def _commit(record: dict) -> None:
+        messages.append(record)
+        if on_turn_committed is not None:
+            try:
+                on_turn_committed(record)
+            except Exception:
+                # Don't let a transcript-archive failure wedge the relay.
+                pass
 
     # Phase 9 C4: relay runs in a Textual @work(thread=True) worker
     # spawned by RoomApp. The closure below is the runner — same body
@@ -976,6 +1036,7 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
     # blocks the main thread until /stop or Ctrl+C; the closure exits
     # naturally once the relay loop breaks.
     def _relay_runner(app=None):
+        nonlocal turns_committed, exit_reason
         # One-time channel-mode banner so the operator sees which path is
         # live (FIFO is always preferred; JSONL only on platforms where
         # mkfifo failed). Useful for post-mortem on resume + audit logs.
@@ -991,28 +1052,61 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
         )
         time.sleep(8)
 
-        # Send initial topic to profile1 only — profile2 hears it through the relay
-        if topic and not prior_messages:
+        # Phase 3: asymmetric kickoff. `topic` (legacy positional) maps
+        # to seed1 unless config.seed1 is explicitly set. seed2 lets the
+        # operator prime profile2 directly — when absent, profile2 starts
+        # cold (current behavior preserved). Both seeds are typed in via
+        # the same envelope shape as `/say` interjections so the receiving
+        # Claude reads them as host messages, not inline directives.
+        seed1_text = config.seed1 if config.seed1 is not None else topic
+        seed2_text = config.seed2
+
+        if seed1_text and not prior_messages:
             ts = _envelope_iso8601_utc()
             initial_msg = build_relay_envelope(
-                sender=USER_NAME,
+                sender=user_name,
                 recipient=get_display_name(profile1),
                 kind="interject",
                 ts=ts,
-                text=topic,
+                text=seed1_text,
             )
             send_to_pane(panes[1], initial_msg)
-            messages.append({
-                "name": USER_NAME,
-                "text": topic,
+            _commit({
+                "name": user_name,
+                "text": seed1_text,
                 "time": datetime.now().isoformat(),
-                "from": USER_NAME,
+                "from": user_name,
                 "to": get_display_name(profile1),
                 # Initial host seed — meta from the conversation's POV.
                 "kind": "relay-meta",
                 "envelope_kind": "interject",
+                "seed_slot": 1,
             })
-            room_control.render_transcript_line(USER_NAME, topic, W)
+            room_control.render_transcript_line(user_name, seed1_text, W)
+
+        if seed2_text and not prior_messages:
+            ts = _envelope_iso8601_utc()
+            initial_msg2 = build_relay_envelope(
+                sender=user_name,
+                recipient=get_display_name(profile2),
+                kind="interject",
+                ts=ts,
+                text=seed2_text,
+            )
+            send_to_pane(panes[2], initial_msg2)
+            _commit({
+                "name": user_name,
+                "text": seed2_text,
+                "time": datetime.now().isoformat(),
+                "from": user_name,
+                "to": get_display_name(profile2),
+                "kind": "relay-meta",
+                "envelope_kind": "interject",
+                "seed_slot": 2,
+            })
+            room_control.render_transcript_line(
+                user_name, f"(→ {get_display_name(profile2)}) {seed2_text}", W,
+            )
 
         # If resuming, send context to both panes (kept as Phase 1 behavior;
         # Phase 5 replaces this with a system-note inject regeneration).
@@ -1043,22 +1137,22 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
             """
             ts = _envelope_iso8601_utc()
             envelope = build_relay_envelope(
-                sender=USER_NAME,
+                sender=user_name,
                 recipient="BOTH",
                 kind="interject",
                 ts=ts,
                 text=text,
             )
-            messages.append({
-                "name": USER_NAME,
+            _commit({
+                "name": user_name,
                 "text": text,
                 "time": datetime.now().isoformat(),
-                "from": USER_NAME,
+                "from": user_name,
                 "to": "BOTH",
                 "kind": "relay-meta",
                 "envelope_kind": "interject",
             })
-            room_control.render_transcript_line(USER_NAME, text, W)
+            room_control.render_transcript_line(user_name, text, W)
             send_to_pane(panes[1], envelope)
             send_to_pane(panes[2], envelope)
 
@@ -1071,23 +1165,23 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 return
             ts = _envelope_iso8601_utc()
             envelope = build_relay_envelope(
-                sender=USER_NAME,
+                sender=user_name,
                 recipient=get_display_name(target),
                 kind="interject",
                 ts=ts,
                 text=text,
             )
-            messages.append({
-                "name": USER_NAME,
+            _commit({
+                "name": user_name,
                 "text": text,
                 "time": datetime.now().isoformat(),
-                "from": USER_NAME,
+                "from": user_name,
                 "to": target,
                 "kind": "relay-meta",
                 "envelope_kind": "interject",
             })
             room_control.render_transcript_line(
-                USER_NAME, f"(→ {target}) {text}", W,
+                user_name, f"(→ {target}) {text}", W,
             )
             send_to_pane(sess, envelope)
 
@@ -1185,8 +1279,14 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
             available — they should agree. If `slot` is missing (legacy
             proxy or external producer), we fall back to the reader's
             slot and emit a one-shot WARN line.
+
+            Phase 3: optional `config.max_chars_per_turn` soft cap.
+            Anything over the cap is truncated in place with a marker
+            and an entry in the room transcript noting the trim — the
+            arbiter sees the truncated text, so the relay sends the
+            shorter version downstream.
             """
-            nonlocal turn_seq
+            nonlocal turn_seq, turns_committed
 
             text = (record.get("text") or "").strip()
             if not text:
@@ -1206,11 +1306,21 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
             color = slot_meta[slot]["color"]
             recipient_display = slot_meta[other_slot]["display"]
 
+            # Phase 3 soft cap. Truncation is the simpler path: rather
+            # than inserting a [SYSTEM] truncate-instruction (which would
+            # need a round-trip to take effect), we trim before relay and
+            # log the trim. The receiving Claude reads what we sent.
+            cap = config.max_chars_per_turn
+            truncated = False
+            if cap is not None and len(text) > cap:
+                text = text[:cap] + f"\n[truncated to {cap} chars]"
+                truncated = True
+
             # Log + render the turn into the cockpit transcript. The
             # `from`/`to`/`envelope_kind` fields make Phase 5's export path
             # parseable without re-regexing the body — it just reads the
             # structured fields directly.
-            messages.append({
+            committed = {
                 "name": display,
                 "text": text,
                 "time": datetime.now().isoformat(),
@@ -1220,7 +1330,12 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 "from": display,
                 "to": recipient_display,
                 "envelope_kind": "turn",
-            })
+                "slot": slot,
+            }
+            if truncated:
+                committed["truncated"] = True
+            _commit(committed)
+            turns_committed += 1
             room_control.render_transcript_line(display, text, color)
 
             if paused:
@@ -1270,7 +1385,7 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                     relay_via_paste_buffer(
                         sys_session, envelope, buffer_name,
                     )
-                    messages.append({
+                    _commit({
                         "name": "SYSTEM",
                         "text": sys_text,
                         "time": datetime.now().isoformat(),
@@ -1378,8 +1493,24 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 if end_after_turn and turn_records:
                     break
 
+                # 7) Phase 3: turn-limit auto-exit. The arbiter doesn't
+                #    enforce this — it's an orchestrator-level cap so the
+                #    operator gets a deterministic stop after N speaker
+                #    turns. Counted via `turns_committed` (only completed
+                #    proxy-emitted turns count; seeds and SYSTEM lines
+                #    don't bump the counter).
+                if (config.turn_limit is not None
+                        and turns_committed >= config.turn_limit):
+                    exit_reason = "turn_limit"
+                    room_control.render_transcript_line(
+                        "ROOM",
+                        f"turn limit reached ({config.turn_limit}); exiting.",
+                        DIM,
+                    )
+                    break
+
         except KeyboardInterrupt:
-            pass
+            exit_reason = "signal"
         finally:
             for r in readers.values():
                 r.close()
@@ -1403,7 +1534,11 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
         )
         app.run()
 
-    return messages
+    # Phase 3: return messages plus the resolved exit_reason so run_room
+    # can stamp meta.yaml with the right lifecycle field. exit_reason is
+    # set by the inner runner — "clean" by default, "signal" on
+    # KeyboardInterrupt, "turn_limit" when config.turn_limit trips.
+    return messages, exit_reason
 
 
 def export_conversation(resume: str, output: str = None) -> Path:
@@ -1496,7 +1631,8 @@ def export_conversation(resume: str, output: str = None) -> Path:
 
 
 def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None,
-             legacy_cockpit: bool = False):
+             legacy_cockpit: bool = False,
+             config: "RoomConfig | None" = None):
     """Main entry point for the room.
 
     legacy_cockpit (Phase 9 C5): when True, fall back to the bespoke
@@ -1505,7 +1641,13 @@ def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None
     Phase 12 deletes the flag (and the legacy module) once the new
     cockpit has run a verification week without regressions. See
     .plan/room-overhaul.md Phase 9 step 7 (line 245).
+
+    Phase 3: `config` is the resolved RoomConfig from cmd_room. When
+    None, a defaulted RoomConfig() is used so legacy programmatic
+    callers still work without re-typing every flag.
     """
+    if config is None:
+        config = RoomConfig()
 
     prior_messages = None
 
@@ -1547,22 +1689,28 @@ def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None
         label = f"slot{slot}/{(profile1, profile2)[slot - 1]}"
         print(f"{DIM}Channel[{label}] = {kind} ({path}){NC}")
 
-    print(f"{DIM}Starting proxies on :{BASE_PORT} and :{BASE_PORT + 1}...{NC}")
-    procs = start_proxies(room_profiles, channels=channels)
+    print(f"{DIM}Starting proxies on :{config.base_port} and :{config.base_port + 1}...{NC}")
+    procs = start_proxies(room_profiles, channels=channels, config=config)
 
-    print(f"{DIM}Setting up tmux session '{TMUX_SESSION}'...{NC}")
-    setup_tmux(profile1, profile2)
+    p1_session = config.session_for(profile1)
+    p2_session = config.session_for(profile2)
+    print(f"{DIM}Setting up tmux sessions '{p1_session}' / '{p2_session}'...{NC}")
+    setup_tmux(profile1, profile2, config=config)
 
+    messages: list = []
+    exit_reason = "clean"
     try:
-        messages = relay_loop(
+        messages, exit_reason = relay_loop(
             profile1, profile2, topic, prior_messages, channels=channels,
-            legacy_cockpit=legacy_cockpit,
+            legacy_cockpit=legacy_cockpit, config=config,
         )
     finally:
         print(f"\n{DIM}Cleaning up...{NC}")
 
-        # Save conversation
-        if 'messages' in dir() and messages:
+        # Save conversation (legacy archive — Phase 3 C4 replaces this
+        # with the per-room state dir + transcript.jsonl appender; kept
+        # in C1 so behavior is unchanged at this commit boundary).
+        if messages:
             path = save_conversation(messages, [profile1, profile2])
             print(f"{DIM}Conversation saved: {path}{NC}")
 
@@ -1585,9 +1733,8 @@ def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None
         print(f"{DIM}Temp profiles removed.{NC}")
 
         # Don't kill tmux sessions — user might want to review
-        p1s = f"room-{profile1}"
-        p2s = f"room-{profile2}"
         print(f"\n{DIM}tmux sessions still running:{NC}")
-        print(f"{DIM}  tmux attach -t {p1s}{NC}")
-        print(f"{DIM}  tmux attach -t {p2s}{NC}")
-        print(f"{DIM}Kill both: tmux kill-session -t {p1s} && tmux kill-session -t {p2s}{NC}\n")
+        print(f"{DIM}  tmux attach -t {p1_session}{NC}")
+        print(f"{DIM}  tmux attach -t {p2_session}{NC}")
+        print(f"{DIM}Kill both: tmux kill-session -t {p1_session} && tmux kill-session -t {p2_session}{NC}\n")
+        print(f"{DIM}Exit reason: {exit_reason}{NC}")

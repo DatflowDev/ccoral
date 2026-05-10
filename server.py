@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from parser import parse_system_prompt, apply_profile, rebuild_system_prompt, dump_tree
 from profiles import load_active_profile, get_active_profile, load_profile
 from refusal import detect_refusal, all_refusals
+from reminders import classify_reminder
 
 # Config
 ANTHROPIC_API = "https://api.anthropic.com"
@@ -65,10 +66,39 @@ logging.basicConfig(
 log = logging.getLogger("ccoral")
 
 
-# Compiled regex for stripping system-reminder tags from messages
+# Compiled regex for matching system-reminder tags. Group 1 captures the
+# inner content so the classifier can decide whether to strip or preserve.
+# Trailing whitespace is in group 2 so a strip absorbs it cleanly.
 _SYSTEM_REMINDER_RE = re.compile(
-    r'<system-reminder>.*?</system-reminder>\s*', re.DOTALL
+    r'<system-reminder>(.*?)</system-reminder>(\s*)', re.DOTALL
 )
+
+
+def _smart_strip_reminders(text: str) -> tuple[str, int]:
+    """Apply content-aware reminder stripping to a text string.
+
+    Each `<system-reminder>...</system-reminder>` block is classified by
+    `reminders.classify_reminder()`; nags get stripped, functional content
+    (deferred-tools list, skills list, MCP server instructions, hook
+    outputs, IDE context) is preserved, and unknown shapes default to
+    preserved (false-preserve is safer than false-strip).
+
+    Returns:
+        (new_text, strip_count) where strip_count is the number of
+        reminder blocks actually stripped (preserves don't count).
+    """
+    strips = [0]
+
+    def _cb(match: "re.Match") -> str:
+        inner = match.group(1)
+        decision, _label = classify_reminder(inner)
+        if decision == "strip":
+            strips[0] += 1
+            return ""  # consume the block AND its trailing whitespace
+        return match.group(0)  # preserve untouched
+
+    new_text = _SYSTEM_REMINDER_RE.sub(_cb, text)
+    return new_text, strips[0]
 
 
 def model_tier(model: str | None) -> str:
@@ -89,18 +119,31 @@ def model_tier(model: str | None) -> str:
 
 def strip_message_tags(body: dict, profile: dict) -> int:
     """
-    Strip <system-reminder> tags from the messages array, across all roles.
+    Smart-strip <system-reminder> tags from the messages array, across all
+    roles. Functional reminders are preserved; behavioral nags are stripped.
 
-    These tags inject dynamic behavioral rules and change per-request,
-    causing cache misses. v1 did this; v2 didn't.
+    Why smart and not blanket
+    --------------------------
+    Earlier versions of this function stripped every reminder. That broke
+    real features in CC 2.1.x: the deferred-tools list (kills ToolSearch),
+    the skills list (kills the Skill tool), MCP Server Instructions (kills
+    MCP usage guidance), and SessionStart/UserPromptSubmit hook context
+    (kills cross-session memory injections from claude-mem and similar).
+    Empirical check on a captured 279-msg Opus 4.7 dump found 32 reminders
+    of which only 9 were actual nags — 23 were functional content the
+    model needs.
 
-    Walks user AND assistant messages. Assistant-side stripping closes
-    the leak where reminder-shaped fragments echoed by the model (e.g.,
-    quoting tool output in its own response) survive into compaction
-    summaries and persist across sessions. The harness only injects
-    reminders on the user side, but the model has no role-aware reading
-    of tag-shape — once `<system-reminder>` literal text lives anywhere
-    in the conversation, downstream summarizers may reproduce it.
+    Each `<system-reminder>...</system-reminder>` block is now classified
+    by `reminders.classify_reminder()`:
+      - functional content (hooks, deferred tools, skills, MCP, IDE
+        context) → preserved
+      - behavioral nags (task-tool nag, mode reminders, "remember to..."
+        prods that change per-request and trash the cache) → stripped
+      - unknown openers → preserved by default (false-preserve > false-strip)
+
+    Walks user AND assistant messages. Cross-role coverage closes the leak
+    where reminder-shaped fragments echoed by the model (e.g., quoting tool
+    output in its own response) propagate into compaction summaries.
 
     Block-type filter:
       - text              → strip (both roles)
@@ -149,7 +192,7 @@ def strip_message_tags(body: dict, profile: dict) -> int:
     for msg in messages:
         content = msg.get("content")
         if isinstance(content, str):
-            cleaned, count = _SYSTEM_REMINDER_RE.subn("", content)
+            cleaned, count = _smart_strip_reminders(content)
             if count:
                 # API rejects empty text — use whitespace as placeholder
                 msg["content"] = cleaned if cleaned.strip() else "."
@@ -174,7 +217,7 @@ def strip_message_tags(body: dict, profile: dict) -> int:
                     text = block.get("text", "")
                     if not isinstance(text, str):
                         continue
-                    cleaned, count = _SYSTEM_REMINDER_RE.subn("", text)
+                    cleaned, count = _smart_strip_reminders(text)
                     if count:
                         if cleaned.strip():
                             block["text"] = cleaned
@@ -185,7 +228,7 @@ def strip_message_tags(body: dict, profile: dict) -> int:
                 elif btype == "tool_result":
                     c = block.get("content")
                     if isinstance(c, str):
-                        cleaned, count = _SYSTEM_REMINDER_RE.subn("", c)
+                        cleaned, count = _smart_strip_reminders(c)
                         if count:
                             # tool_result must have non-empty content — "."
                             # placeholder if the reminder was the whole body
@@ -199,7 +242,7 @@ def strip_message_tags(body: dict, profile: dict) -> int:
                                 t = sub.get("text", "")
                                 if not isinstance(t, str):
                                     continue
-                                cleaned, count = _SYSTEM_REMINDER_RE.subn("", t)
+                                cleaned, count = _smart_strip_reminders(t)
                                 if count:
                                     sub["text"] = cleaned if cleaned.strip() else "."
                                     total_stripped += count

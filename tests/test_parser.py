@@ -8,8 +8,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from parser import parse_system_prompt, apply_profile, rebuild_system_prompt
 from server import model_tier, strip_message_tags
 from refusal import detect_refusal, all_refusals, REFUSAL_PATTERNS
+from reminders import classify_reminder
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+# Reusable fixture strings — bare literals to keep test readable. The
+# `<system-reminder>` opener/closer are spelled out in code, not inlined
+# elsewhere, so the test stays robust to harness display quirks.
+_OPEN = "<system-reminder>"
+_CLOSE = "</system-reminder>"
+_NAG = (
+    _OPEN
+    + "The task tools haven't been used recently. If you're working on a "
+      "multi-file change, consider using them."
+    + _CLOSE
+)
+_DEFERRED = (
+    _OPEN
+    + "The following deferred tools are now available via ToolSearch: "
+      "NotebookEdit, MultiEdit, ..."
+    + _CLOSE
+)
+_HOOK = (
+    _OPEN
+    + "SessionStart hook additional context: # [project] recent context, "
+      "2026-05-09 ..."
+    + _CLOSE
+)
 
 
 def assert_in(name, blocks, where="parse"):
@@ -86,52 +111,64 @@ def test_apply_profile_subagent_fixture():
 
 
 def test_strip_message_tags_cross_role():
-    """Verify <system-reminder> stripping walks both user and assistant text,
-    skips tool_use blocks, and leaves thinking-block signatures intact."""
+    """Smart-strip: nag reminders are removed; functional reminders (deferred
+    tools, skills, MCP, hook outputs, IDE context) are preserved across all
+    roles and text-bearing block types. Thinking and redacted_thinking blocks
+    are protocol-protected and never touched. tool_use blocks untouched.
+
+    Fixture mirrors categories from a captured Opus 4.7 dump (raw-eni-
+    executor-claude-opu.json: 32 reminders, 9 nags, 23 functional)."""
     body = {
         "messages": [
-            # User text (string content) — must strip
-            {"role": "user", "content": "hello <system-reminder>nag</system-reminder> world"},
-            # Assistant text block — must strip (this is the Phase 2 fix)
+            # 0: User string with one nag and one hook. Only nag stripped.
+            {"role": "user", "content": f"hello {_NAG} {_HOOK} world"},
+            # 1: Assistant text (nag) + tool_use. Text gets nag stripped, tool_use intact.
             {
                 "role": "assistant",
                 "content": [
-                    {"type": "text", "text": "ok <system-reminder>echoed</system-reminder> done"},
+                    {"type": "text", "text": f"ok {_NAG} done"},
                     {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
                 ],
             },
-            # User tool_result — must strip
+            # 2: User tool_result with deferred-tools (functional, must survive).
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "tool_result",
                         "tool_use_id": "t1",
-                        "content": "stdout <system-reminder>nag2</system-reminder> end",
+                        "content": f"stdout {_DEFERRED} end",
                     }
                 ],
             },
-            # Assistant thinking — must NOT strip. Anthropic protocol
-            # requires thinking blocks be replayed unchanged during tool-use
-            # multi-turn flows; modifying invalidates the signature, dropping
-            # breaks tool_use→tool_result continuity. Reminder text inside
-            # thinking is a real leak path but the safe fix point is the
-            # conversation summarizer (Phase 5), not the request-side strip.
+            # 3: User tool_result whose content is a list of text sub-blocks
+            # mixing a nag and a hook — nag stripped, hook preserved.
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t2",
+                        "content": [
+                            {"type": "text", "text": f"line1 {_NAG} end1"},
+                            {"type": "text", "text": f"line2 {_HOOK} end2"},
+                        ],
+                    }
+                ],
+            },
+            # 4: Assistant thinking — protocol-protected, never touched.
             {
                 "role": "assistant",
                 "content": [
                     {
                         "type": "thinking",
-                        "thinking": "internal <system-reminder>preserved</system-reminder> note",
+                        "thinking": f"internal {_NAG} note",
                         "signature": "abc123",
                     },
                     {"type": "text", "text": "visible answer"},
                 ],
             },
-            # Assistant redacted_thinking — must NOT strip. Encrypted content
-            # in `data` field, same protocol constraint. Per Anthropic docs:
-            # "Filtering on block.type == 'thinking' alone silently drops
-            # redacted_thinking blocks and breaks the multi-turn protocol."
+            # 5: Assistant redacted_thinking — protocol-protected.
             {
                 "role": "assistant",
                 "content": [
@@ -145,34 +182,73 @@ def test_strip_message_tags_cross_role():
         ]
     }
     count = strip_message_tags(body, {})
-    assert count == 3, f"expected 3 strips (user-string, assistant-text, tool_result), got {count}"
+    # Three nags total: msg[0], msg[1].text, msg[3].tool_result.content[0]
+    assert count == 3, f"expected 3 nag strips, got {count}"
 
     msgs = body["messages"]
-    # User string
-    assert "<system-reminder>" not in msgs[0]["content"], "user string not stripped"
-    # Assistant text block
-    assert "<system-reminder>" not in msgs[1]["content"][0]["text"], (
-        "assistant text not stripped (Phase 2 leak)"
+    # 0: nag gone, hook preserved
+    assert "haven't been used recently" not in msgs[0]["content"], "nag survived"
+    assert "SessionStart hook" in msgs[0]["content"], "hook was eaten"
+    # 1: assistant nag gone, tool_use untouched
+    assert "haven't been used recently" not in msgs[1]["content"][0]["text"], (
+        "assistant nag survived"
     )
-    # tool_use block untouched
     assert msgs[1]["content"][1]["type"] == "tool_use", "tool_use mangled"
-    # tool_result
-    assert "<system-reminder>" not in msgs[2]["content"][0]["content"], (
-        "tool_result not stripped"
+    # 2: deferred-tools list preserved (the actual MCP/tool-search fix)
+    assert "deferred tools are now available" in msgs[2]["content"][0]["content"], (
+        "deferred-tools reminder was eaten — ToolSearch would be broken"
     )
-    # Thinking preserved (protocol requires unchanged replay)
-    assert "<system-reminder>" in msgs[3]["content"][0]["thinking"], (
-        "thinking block was modified — would invalidate signature, break replay"
+    # 3: nested tool_result list — nag gone from sub[0], hook preserved in sub[1]
+    sub_blocks = msgs[3]["content"][0]["content"]
+    assert "haven't been used recently" not in sub_blocks[0]["text"], (
+        "nested nag survived"
     )
-    assert msgs[3]["content"][0]["signature"] == "abc123", "signature mutated"
-    # redacted_thinking preserved (same protocol constraint)
-    assert msgs[4]["content"][0]["type"] == "redacted_thinking", (
-        "redacted_thinking block was dropped — would break multi-turn protocol"
+    assert "SessionStart hook" in sub_blocks[1]["text"], "nested hook was eaten"
+    # 4: thinking untouched (signature stays valid)
+    assert "haven't been used recently" in msgs[4]["content"][0]["thinking"], (
+        "thinking was modified — would invalidate signature"
     )
-    assert msgs[4]["content"][0]["data"] == "Eo8FCkYICRgCKkBopaque", (
-        "redacted_thinking data field was modified"
+    assert msgs[4]["content"][0]["signature"] == "abc123", "signature mutated"
+    # 5: redacted_thinking untouched
+    assert msgs[5]["content"][0]["type"] == "redacted_thinking", (
+        "redacted_thinking was dropped"
+    )
+    assert msgs[5]["content"][0]["data"] == "Eo8FCkYICRgCKkBopaque", (
+        "redacted_thinking data field mutated"
     )
     print("test_strip_message_tags_cross_role: OK")
+
+
+def test_smart_strip_classifier_branches():
+    """Direct test of the reminders classifier. Each PRESERVE and NAG
+    pattern category produces the expected decision so a regression in
+    pattern coverage is caught at unit-test time, not in production."""
+    preserves = [
+        "The following deferred tools are now available via ToolSearch: ...",
+        "The following skills are available for use with the Skill tool: ...",
+        "# MCP Server Instructions\n\nMCP servers...",
+        "SessionStart hook additional context: ...",
+        "SessionStart:startup hook success: {...}",
+        "UserPromptSubmit hook additional context: ...",
+        "The user opened the file /tmp/x.py",
+        "The user sent a new message while you were working: foo",
+    ]
+    nags = [
+        "The task tools haven't been used recently. ...",
+        "The task tool hasn't been used recently. ...",
+        "# Plan mode is active. ...",
+        "Remember to use absolute paths.",
+    ]
+    for text in preserves:
+        d, _ = classify_reminder(text)
+        assert d == "preserve", f"expected preserve for {text!r}, got {d}"
+    for text in nags:
+        d, _ = classify_reminder(text)
+        assert d == "strip", f"expected strip for {text!r}, got {d}"
+    # Unknown shapes default to preserve (false-preserve > false-strip)
+    d, _ = classify_reminder("some weird new shape we have not seen")
+    assert d == "unknown"
+    print("test_smart_strip_classifier_branches: OK")
 
 
 def test_refusal_detection():
@@ -245,6 +321,7 @@ if __name__ == "__main__":
     test_apply_profile_main()
     test_apply_profile_subagent_fixture()
     test_strip_message_tags_cross_role()
+    test_smart_strip_classifier_branches()
     test_refusal_detection()
     test_model_tier()
     print("\nAll tests passed.")

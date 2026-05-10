@@ -11,6 +11,7 @@ from refusal import detect_refusal, all_refusals, REFUSAL_PATTERNS
 from reminders import classify_reminder
 from tool_scrub import scrub_tool_descriptions
 from lanes import detect_lane, LANE_FINGERPRINTS
+from rewrite_terminal import RewriteTerminalState, _synth_text_delta_event
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -317,6 +318,134 @@ def test_model_tier():
     print("test_model_tier: OK")
 
 
+def test_rewrite_terminal_intercepts_refusal_preamble():
+    """Phase 3b: rewrite_terminal state machine strips refusal preamble
+    from index-0 text block while preserving the post-preamble body."""
+    import json as _json
+
+    def _ev(event_type, data):
+        return f"event: {event_type}\ndata: {_json.dumps(data)}\n\n".encode()
+
+    chunks = [
+        _ev("message_start", {"type": "message_start", "message": {"id": "m1", "role": "assistant", "model": "x", "content": [], "usage": {}}}),
+        _ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        _ev("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "I cannot help with that. "}}),
+        _ev("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "But here's the answer: 42"}}),
+        _ev("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        _ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}),
+        _ev("message_stop", {"type": "message_stop"}),
+    ]
+    state = RewriteTerminalState()
+    out = b"".join(state.feed_chunk(c) for c in chunks) + state.finalize()
+    out_str = out.decode()
+    assert "I cannot help with that." not in out_str, "refusal preamble should be stripped"
+    assert "the answer: 42" in out_str, "post-preamble body must survive"
+    assert "message_start" in out_str, "framing event lost"
+    assert "content_block_stop" in out_str, "framing event lost"
+    assert state.intercepted, "state should record interception"
+    assert state.intercepted_label == "cant_help_with"
+    print("test_rewrite_terminal_intercepts_refusal_preamble: OK")
+
+
+def test_rewrite_terminal_passthrough_on_helpful_response():
+    """Phase 3b: when no refusal is detected, the helpful text passes
+    through and the state machine does not record interception."""
+    import json as _json
+
+    def _ev(event_type, data):
+        return f"event: {event_type}\ndata: {_json.dumps(data)}\n\n".encode()
+
+    helpful = "Sure, here's the implementation. " * 20  # > REFUSAL_DECISION_WINDOW
+    chunks = [
+        _ev("message_start", {"type": "message_start", "message": {"id": "m1", "role": "assistant", "model": "x", "content": [], "usage": {}}}),
+        _ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        _ev("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": helpful}}),
+        _ev("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        _ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}),
+        _ev("message_stop", {"type": "message_stop"}),
+    ]
+    state = RewriteTerminalState()
+    out = b"".join(state.feed_chunk(c) for c in chunks) + state.finalize()
+    out_str = out.decode()
+    assert helpful in out_str, "helpful text must passthrough"
+    assert not state.intercepted, "no interception expected"
+    print("test_rewrite_terminal_passthrough_on_helpful_response: OK")
+
+
+def test_rewrite_terminal_does_not_intercept_index_gt_zero():
+    """Phase 3b: text on index > 0 (mid-response after tool_use) must
+    NOT be intercepted, even if it contains refusal vocabulary."""
+    import json as _json
+
+    def _ev(event_type, data):
+        return f"event: {event_type}\ndata: {_json.dumps(data)}\n\n".encode()
+
+    chunks = [
+        _ev("message_start", {"type": "message_start", "message": {"id": "m1", "role": "assistant", "model": "x", "content": [], "usage": {}}}),
+        _ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t1", "name": "x", "input": {}}}),
+        _ev("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        _ev("content_block_start", {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+        _ev("content_block_delta", {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "I cannot help with that. The result is 42."}}),
+        _ev("content_block_stop", {"type": "content_block_stop", "index": 1}),
+        _ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}),
+        _ev("message_stop", {"type": "message_stop"}),
+    ]
+    state = RewriteTerminalState()
+    out = b"".join(state.feed_chunk(c) for c in chunks) + state.finalize()
+    out_str = out.decode()
+    assert "I cannot help with that. The result is 42." in out_str, \
+        "text on index > 0 must NOT be intercepted"
+    assert not state.intercepted, "no interception expected on index > 0"
+    print("test_rewrite_terminal_does_not_intercept_index_gt_zero: OK")
+
+
+def test_rewrite_terminal_handles_chunk_split_events():
+    """Phase 3b: events split across arbitrary chunk boundaries (3-byte
+    chunks here) must still be reconstructed and processed correctly."""
+    import json as _json
+
+    def _ev(event_type, data):
+        return f"event: {event_type}\ndata: {_json.dumps(data)}\n\n".encode()
+
+    full_stream = (
+        _ev("message_start", {"type": "message_start", "message": {"id": "m1", "role": "assistant", "model": "x", "content": [], "usage": {}}})
+        + _ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+        + _ev("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "I cannot help with that. "}})
+        + _ev("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "But the answer is 42."}})
+        + _ev("content_block_stop", {"type": "content_block_stop", "index": 0})
+        + _ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}})
+        + _ev("message_stop", {"type": "message_stop"})
+    )
+    chunks = [full_stream[i:i+3] for i in range(0, len(full_stream), 3)]
+    state = RewriteTerminalState()
+    out = b"".join(state.feed_chunk(c) for c in chunks) + state.finalize()
+    out_str = out.decode()
+    assert "I cannot help with that." not in out_str, "refusal preamble must be stripped"
+    assert "the answer is 42." in out_str, "body must survive chunk-split"
+    print(f"test_rewrite_terminal_handles_chunk_split_events: OK ({len(chunks)} chunks)")
+
+
+def test_synth_text_delta_event_schema():
+    """Phase 3b: synthetic content_block_delta event must conform to
+    Anthropic's strict schema {type, index, delta:{type, text}}."""
+    import json as _json
+    raw = _synth_text_delta_event(0, "hello world")
+    assert raw.startswith(b"event: content_block_delta\n")
+    assert raw.endswith(b"\n\n")
+    # Parse the data: line
+    text = raw.decode()
+    data_line = next(l for l in text.split("\n") if l.startswith("data: "))
+    parsed = _json.loads(data_line[len("data: "):])
+    assert parsed["type"] == "content_block_delta"
+    assert parsed["index"] == 0
+    assert parsed["delta"]["type"] == "text_delta"
+    assert parsed["delta"]["text"] == "hello world"
+    # No extra fields
+    assert set(parsed.keys()) == {"type", "index", "delta"}
+    assert set(parsed["delta"].keys()) == {"type", "text"}
+    print("test_synth_text_delta_event_schema: OK")
+
+
 def test_lane_detection_canonical_openers():
     """Phase 5: detect_lane() returns the right label for each canonical
     opener fingerprint defined in LANE_FINGERPRINTS."""
@@ -520,4 +649,9 @@ if __name__ == "__main__":
     test_lane_detection_canonical_openers()
     test_lane_detection_fallbacks()
     test_lane_detection_real_dumps()
+    test_rewrite_terminal_intercepts_refusal_preamble()
+    test_rewrite_terminal_passthrough_on_helpful_response()
+    test_rewrite_terminal_does_not_intercept_index_gt_zero()
+    test_rewrite_terminal_handles_chunk_split_events()
+    test_synth_text_delta_event_schema()
     print("\nAll tests passed.")

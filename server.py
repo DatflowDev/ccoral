@@ -48,6 +48,7 @@ from refusal import detect_refusal, all_refusals
 from reminders import classify_reminder
 from tool_scrub import scrub_tool_descriptions
 from lanes import detect_lane
+from rewrite_terminal import RewriteTerminalState
 
 # Config
 ANTHROPIC_API = "https://api.anthropic.com"
@@ -674,22 +675,53 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             block_starts: list[str] = []  # types of content_block_start
             seen_stop_reason: str | None = None
 
+            # Phase 3b: rewrite_terminal mode wraps each upstream chunk
+            # through a state machine that buffers index-0 text deltas
+            # until a refusal decision is made. Other modes (passthrough,
+            # log) use the byte-passthrough fast path below — zero
+            # added latency, byte-identical to upstream.
+            _use_rewrite_terminal = (_refusal_policy == "rewrite_terminal")
+            _rewrite_state: "RewriteTerminalState | None" = (
+                RewriteTerminalState() if _use_rewrite_terminal else None
+            )
+
             t_first_chunk = None
             bytes_streamed = 0
             async for chunk in upstream.content.iter_any():
                 if t_first_chunk is None:
                     t_first_chunk = _time.perf_counter()
-                bytes_streamed += len(chunk)
-                await response.write(chunk)
 
-                # Accumulate rolling tail of raw SSE for post-hoc inspection.
+                # Phase 3b: route the chunk through the state machine
+                # before forwarding. The machine returns the bytes that
+                # should reach the client (which may be the same as
+                # `chunk`, may be a synthetic delta, or may be empty
+                # while still buffering).
+                if _rewrite_state is not None:
+                    forward_bytes = _rewrite_state.feed_chunk(chunk)
+                else:
+                    forward_bytes = chunk
+
+                if forward_bytes:
+                    try:
+                        await response.write(forward_bytes)
+                    except aiohttp.ClientConnectionResetError:
+                        # Client disconnected mid-stream — tear down
+                        # cleanly so we don't leak the upstream socket.
+                        log.info("Client disconnected mid-stream; aborting upstream")
+                        upstream.close()
+                        return response
+                    bytes_streamed += len(forward_bytes)
+
+                # Accumulate rolling tail of raw SSE (UPSTREAM bytes,
+                # not forwarded — for post-hoc inspection of what the
+                # API actually emitted, including any preamble we hid).
                 sse_tail.append(chunk)
                 sse_tail_bytes += len(chunk)
                 while sse_tail_bytes > SSE_TAIL_MAX and len(sse_tail) > 1:
                     dropped = sse_tail.pop(0)
                     sse_tail_bytes -= len(dropped)
 
-                # One-shot full dump capture
+                # One-shot full dump capture (also raw upstream)
                 if full_sse is not None:
                     full_sse.append(chunk)
 
@@ -722,6 +754,27 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                                 captured_text.append(delta.get("text", ""))
                 except Exception:
                     pass
+
+            # Phase 3b: flush any pending state-machine buffer at stream
+            # end (in case upstream cut off mid-buffer with no
+            # content_block_stop — defensive flush of accumulated text
+            # without applying refusal stripping).
+            if _rewrite_state is not None:
+                tail = _rewrite_state.finalize()
+                if tail:
+                    try:
+                        await response.write(tail)
+                    except aiohttp.ClientConnectionResetError:
+                        pass
+                    else:
+                        bytes_streamed += len(tail)
+                if _rewrite_state.intercepted:
+                    log.warning(
+                        f"REWRITE_TERMINAL intercepted refusal "
+                        f"(profile={profile_name}, model={body.get('model','?')}, "
+                        f"label={_rewrite_state.intercepted_label}, "
+                        f"chars_removed={_rewrite_state.intercepted_chars})"
+                    )
 
             # Write captured response to file for room relay
             # Skip short responses (titles, summaries) and non-main-model calls

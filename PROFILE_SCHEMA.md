@@ -77,9 +77,16 @@ apply_to_subagents: false  # default: false
 #                       response still streams to the user unchanged.
 #                       Use this to characterize refusal rate before
 #                       deciding on stronger interception.
-#   rewrite_terminal  (Phase 3b, NOT YET IMPLEMENTED) — strip the refusal
-#                       preamble before it reaches the client; let the
-#                       remainder of the response stream through.
+#   rewrite_terminal  — buffer the first text block (index 0) until a
+#                       decision can be made (200 chars or block stop).
+#                       If a refusal preamble is detected, suppress only
+#                       the preamble and stream the post-preamble body
+#                       through. Other event types (tool_use, thinking,
+#                       index>0 text, message framing) pass through
+#                       verbatim. State machine in rewrite_terminal.py.
+#                       Adds up to ~6s decision latency in the worst
+#                       case (200 chars × 30ms typing) — usually <1s
+#                       because real refusals preamble fast.
 #   reset_turn        (Phase 3c, NOT YET IMPLEMENTED) — abort the upstream
 #                       request mid-refusal and re-issue with stronger
 #                       anti-refusal framing prepended; stream the new

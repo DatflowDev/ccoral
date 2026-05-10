@@ -358,6 +358,10 @@ def _parse_room_args(args: list) -> dict:
         "no_picker": False,
         "ls": False,
         "show_id": None,
+        # Phase 6 sidecars.
+        "watch_id": None,
+        "serve_id": None,
+        "serve_port": 8095,
         # RoomConfig-bound (None means "use RoomConfig default").
         "user": None,
         "port": None,
@@ -483,6 +487,14 @@ def _parse_room_args(args: list) -> dict:
             # `ccoral room show <id>` — page transcript.
             out["show_id"] = _need_value("show", i + 1)
             i += 2
+        elif a == "watch":
+            # `ccoral room watch <id|last>` (Phase 6 sidecar).
+            out["watch_id"] = _need_value("watch", i + 1)
+            i += 2
+        elif a == "serve":
+            # `ccoral room serve <id|last> [--port N]` (Phase 6 sidecar).
+            out["serve_id"] = _need_value("serve", i + 1)
+            i += 2
         elif a == "delete":
             # `ccoral room delete <id> [--yes]`
             out["delete_id"] = _need_value("delete", i + 1)
@@ -565,6 +577,23 @@ def cmd_room(args: list):
         room_show(parsed["show_id"])
         return
 
+    # `ccoral room watch <id|last>` — Phase 6 read-only Textual tail.
+    if parsed["watch_id"]:
+        from room_watch import run_watch
+        sys.exit(run_watch(
+            parsed["watch_id"],
+            user_name=parsed["user"] or "CASSIUS",
+        ))
+
+    # `ccoral room serve <id|last> [--port N]` — Phase 6 loopback aiohttp.
+    if parsed["serve_id"]:
+        from room_serve import run_serve
+        sys.exit(run_serve(
+            parsed["serve_id"],
+            port=parsed["serve_port"],
+            user_name=parsed["user"] or "CASSIUS",
+        ))
+
     # `ccoral room delete <id> [--yes]`
     if parsed["delete_id"]:
         from room import delete_room
@@ -622,6 +651,8 @@ def cmd_room(args: list):
             print(f"       ccoral room --export <last|id|filename> [--format md|jsonl|html] [--output path]")
             print(f"       ccoral room ls")
             print(f"       ccoral room show <id|last>")
+            print(f"       ccoral room watch <id|last>")
+            print(f"       ccoral room serve <id|last> [--port N]")
             print(f"       ccoral room delete <id|last> [--yes]")
             print(f"       ccoral room rename <id|last> <new-id>")
             sys.exit(1)

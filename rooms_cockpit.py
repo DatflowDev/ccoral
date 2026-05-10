@@ -137,6 +137,37 @@ class RoomLine(Message):
         self.record = record
 
 
+class RoomStopped(Message):
+    """The room's meta.yaml flipped to ``state: stopped`` (the per-room
+    state dir's exit-marker contract from Phase 3) and the tailer has
+    seen no new bytes since.
+
+    Tab label gets a `(stopped)` decoration; the App schedules a 30s
+    grace removal via ``set_timer``. ``r`` while the badge is visible
+    reopens by re-spawning the tailer.
+    """
+
+    def __init__(self, room_id: str) -> None:
+        super().__init__()
+        self.room_id = room_id
+
+
+class RoomBroken(Message):
+    """The room is in an inconsistent state — typically ``state: live``
+    in meta.yaml but the tmux session has disappeared (hard-kill, host
+    crash, etc.).
+
+    Tab label gains a red `× broken` badge so the operator knows the
+    transcript will not advance. The cockpit does not attempt repair
+    — it remains read-only on lifecycle per the Phase 11 contract.
+    """
+
+    def __init__(self, room_id: str, error: str = "") -> None:
+        super().__init__()
+        self.room_id = room_id
+        self.error = error
+
+
 class RoomActivity(Message):
     """A worker wrote a line to a non-active room. Tab label gains a
     `+` badge until the operator focuses the tab (or hits Ctrl+L to
@@ -171,6 +202,7 @@ class RoomsCockpit(App):
         Binding("ctrl+p", "prev_tab", "Prev room", priority=True),
         Binding("ctrl+u", "toggle_unified", "Unified ↔ tabs"),
         Binding("ctrl+l", "clear_badges", "Clear badges"),
+        Binding("r", "reopen_stopped", "Reopen stopped"),
         Binding("ctrl+c,q", "quit", "Quit", priority=True),
     ]
 
@@ -225,6 +257,17 @@ class RoomsCockpit(App):
         # hits Ctrl+L. Public so tests can assert without scraping the
         # tab label string.
         self.activity_badges: set[str] = set()
+        # Per-room lifecycle state, surfaced via tab label decoration.
+        # "live" / "stopped" / "broken". Defaults to "live" for every
+        # discovered room; the tailer transitions on EOF + meta state.
+        self.room_states: dict[str, str] = {}
+        # Grace-removal handles for stopped rooms. Mapped so a re-open
+        # (`r` key) can cancel the pending removal.
+        self._stopped_timers: dict[str, Any] = {}
+        # Grace window before a stopped room's tab is removed. 30s per
+        # plan line 588. Tests override to 0 so the assertion path
+        # doesn't have to sleep.
+        self.stopped_grace_s: float = 30.0
 
     # ─── compose / lifecycle ───────────────────────────────────────────
 
@@ -375,27 +418,45 @@ class RoomsCockpit(App):
         via ``post_message`` — the @on(RoomLine) handler then writes to
         the right RichLog.
 
+        Lifecycle:
+          - meta.yaml shows ``state: stopped`` AND no new bytes since
+            last read → post RoomStopped, exit cleanly. C5.
+          - meta.yaml still ``state: live`` BUT tmux session gone →
+            post RoomBroken, exit cleanly. C5 (handles the hard-kill
+            edge case Phase 3's notes flagged).
+          - Any unhandled exception inside the worker → caught at the
+            top level, surfaced as RoomBroken, worker exits. C5 — one
+            broken room must not wedge the cockpit.
+
         Per the Phase 11 hard rules: this worker performs no subprocess
-        spawn, no relay-loop call, no run_room call. It strictly reads
-        a JSONL file and emits messages.
+        spawn (other than the read-only ``tmux has-session`` liveness
+        probe), no relay-loop call, no run_room call.
+        """
+        try:
+            self._tail_loop(room_id, jsonl_path)
+        except Exception as exc:  # crash isolation per plan line 590
+            self.post_message(RoomBroken(room_id, repr(exc)))
+
+    def _tail_loop(self, room_id: str, jsonl_path: str) -> None:
+        """Inner loop for tail_room. Split out so the wrapper can
+        catch any exception in one place without the lifecycle
+        bookkeeping muddying the read path.
         """
         path = Path(jsonl_path)
         cursor = self._cursors.setdefault(room_id, 0)
         buf = self._line_bufs.setdefault(room_id, b"")
+        # Liveness probe cadence: every Nth idle iteration we re-stat
+        # the meta.yaml + tmux. 8 ticks * 250ms = 2s — matches the
+        # plan's verification target ("(stopped) badge within 2s").
+        liveness_every_n_ticks = 8
+        idle_ticks = 0
         while True:
             try:
                 size = path.stat().st_size
             except FileNotFoundError:
-                # Transcript not yet created — wait and retry. A freshly
-                # started room writes its first record only after the
-                # first turn lands; the watch sidecar handles this the
-                # same way (see room_watch.py:158).
                 time.sleep(self.poll_interval)
                 continue
             if size < cursor:
-                # File truncated / rotated (rename / delete). Reset and
-                # restart the read from the head — the same forgiving
-                # behavior room_watch.py adopts.
                 cursor = 0
                 buf = b""
             if size > cursor:
@@ -418,15 +479,27 @@ class RoomsCockpit(App):
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    # post_message is the documented thread-safe path
-                    # for delivering messages from a worker thread.
                     self.post_message(RoomLine(room_id, rec))
-                # Persist the cursor + carry-buffer for any external
-                # introspection (and so a worker restart resumes
-                # cleanly without re-rendering already-seen turns).
                 self._cursors[room_id] = cursor
                 self._line_bufs[room_id] = buf
+                idle_ticks = 0
             else:
+                idle_ticks += 1
+                # Lifecycle probe: stopped flag in meta.yaml, OR live
+                # flag with the tmux session vanished.
+                if idle_ticks >= liveness_every_n_ticks:
+                    idle_ticks = 0
+                    state = _check_room_lifecycle(
+                        room_id, base=self._discovery_base,
+                    )
+                    if state == "stopped":
+                        self.post_message(RoomStopped(room_id))
+                        return
+                    if state == "broken":
+                        self.post_message(RoomBroken(
+                            room_id, "live in meta but tmux session gone",
+                        ))
+                        return
                 time.sleep(self.poll_interval)
 
     # ─── input dispatch ────────────────────────────────────────────────
@@ -663,6 +736,108 @@ class RoomsCockpit(App):
         if room_id != self._active_room_id():
             self.post_message(RoomActivity(room_id))
 
+    def on_room_stopped(self, message: RoomStopped) -> None:
+        """Tailer reported the room transitioned to ``state: stopped``.
+        Decorate the tab label, render a transcript divider, and
+        schedule the 30s grace removal.
+        """
+        room_id = message.room_id
+        if self.room_states.get(room_id) == "stopped":
+            return
+        self.room_states[room_id] = "stopped"
+        self._refresh_tab_label(room_id)
+        try:
+            log = self.query_one(f"#{_log_id(room_id)}", RichLog)
+            log.write(f"  [stopped]room {room_id} stopped[/stopped]")
+        except Exception:
+            pass
+        # Schedule the grace removal. Tests pass stopped_grace_s=0
+        # which still goes through set_timer so the assertion path is
+        # uniform.
+        try:
+            handle = self.set_timer(
+                self.stopped_grace_s,
+                lambda rid=room_id: self._remove_room(rid),
+            )
+            self._stopped_timers[room_id] = handle
+        except Exception:
+            # set_timer may raise during teardown; benign.
+            pass
+
+    def on_room_broken(self, message: RoomBroken) -> None:
+        """Tailer surfaced a broken state (live+tmux-gone, or an
+        unhandled exception inside the read loop). Decorate the tab
+        label red and render the error so the operator can diagnose
+        without leaving the cockpit.
+        """
+        room_id = message.room_id
+        if self.room_states.get(room_id) == "broken":
+            return
+        self.room_states[room_id] = "broken"
+        self._refresh_tab_label(room_id)
+        try:
+            log = self.query_one(f"#{_log_id(room_id)}", RichLog)
+            log.write(
+                f"  [broken]room {room_id} broken: "
+                f"{_escape_markup(message.error)}[/broken]"
+            )
+        except Exception:
+            pass
+
+    def _remove_room(self, room_id: str) -> None:
+        """Remove a stopped room's tab + RichLog after the grace
+        window. Idempotent — a re-open before the timer fires clears
+        the entry from ``_stopped_timers`` so this is a no-op then.
+        """
+        if room_id not in self._stopped_timers:
+            return
+        self._stopped_timers.pop(room_id, None)
+        # Only remove if the room is still in stopped state — a re-
+        # open via `r` would have flipped it back to live.
+        if self.room_states.get(room_id) != "stopped":
+            return
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+            tabs.remove_pane(_pane_id(room_id))
+        except Exception:
+            pass
+        if room_id in self.room_ids:
+            self.room_ids.remove(room_id)
+        self.room_states.pop(room_id, None)
+        self.activity_badges.discard(room_id)
+
+    def action_reopen_stopped(self) -> None:
+        """`r` — re-spawn a tailer for the currently focused stopped
+        room (if any). Cancels the pending grace removal so the tab
+        sticks around.
+        """
+        active = self._active_room_id()
+        if active is None:
+            return
+        if self.room_states.get(active) != "stopped":
+            return
+        # Cancel the grace removal and reset state.
+        timer = self._stopped_timers.pop(active, None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        self.room_states[active] = "live"
+        self._refresh_tab_label(active)
+        try:
+            log = self.query_one(f"#{_log_id(active)}", RichLog)
+            log.write(f"  [system]reopening tailer for {active}[/system]")
+        except Exception:
+            pass
+        # Re-resolve the transcript path and respawn. The byte cursor
+        # persists across the gap so we don't double-render lines that
+        # already landed.
+        transcript = self._transcript_path_for(active)
+        if transcript is None:
+            return
+        self.tail_room(active, str(transcript))
+
     def on_room_activity(self, message: RoomActivity) -> None:
         """A worker reported activity on a non-active tab. Decorate the
         tab label with a `+` badge if not already present.
@@ -743,12 +918,22 @@ class RoomsCockpit(App):
     # ─── helpers ───────────────────────────────────────────────────────
 
     def _tab_label(self, room_id: str) -> str:
-        """Compose the visible tab label.
+        """Compose the visible tab label with lifecycle + activity
+        decoration.
 
-        Format: ``<id> [+]`` when activity is pending. C5 will extend
-        this with ``(stopped)`` / ``× broken`` decorations.
+        Format: ``<id>[ +][ (stopped)|× broken]``. The activity badge
+        is purely cosmetic on a stopped/broken tab — kept anyway so a
+        late-arriving record (the tailer's last write before EOF)
+        doesn't silently re-decorate an otherwise-quiet pane.
         """
-        suffix = " [+]" if room_id in self.activity_badges else ""
+        suffix = ""
+        if room_id in self.activity_badges:
+            suffix += " [+]"
+        state = self.room_states.get(room_id)
+        if state == "stopped":
+            suffix += " (stopped)"
+        elif state == "broken":
+            suffix += " × broken"
         return f"{room_id}{suffix}"
 
     def _refresh_tab_label(self, room_id: str) -> None:
@@ -811,3 +996,97 @@ def _room_id_from_pane(pane_id: str) -> str:
     if pane_id.startswith("pane-"):
         return pane_id[len("pane-"):]
     return pane_id
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle probe — resolves the room state from meta.yaml (Phase 3
+# contract) and cross-checks live sessions against tmux. Used by the
+# tailer's idle-tick liveness check.
+#
+# Returns one of:
+#   "live"     — meta.yaml ``state: live`` AND tmux sessions present.
+#   "stopped"  — meta.yaml ``state: stopped``.
+#   "broken"   — meta.yaml ``state: live`` BUT tmux sessions absent
+#                (the hard-kill edge case Phase 3's notes flagged).
+#   "unknown"  — meta.yaml unreadable; treat as live for now to avoid
+#                false-positive removals on a transient FS hiccup.
+#
+# Pure read-only: stat the meta file, parse yaml, run `tmux has-session`
+# (no -t side-effects). No subprocess.run with shell=True, no
+# write paths.
+# ---------------------------------------------------------------------------
+
+
+def _check_room_lifecycle(
+    room_id: str, *, base: "Path | None" = None,
+) -> str:
+    """Classify a room as live / stopped / broken / unknown.
+
+    Reads ``<base>/<room_id>/meta.yaml`` (defaults to
+    ``~/.ccoral/rooms``). When state is "live", also probes
+    ``tmux has-session -t <prefix>-<profile>`` for each profile to
+    catch hard-killed rooms whose meta never got the stopped flag.
+    """
+    import subprocess
+    import yaml as _yaml
+
+    from room import ROOMS_ARCHIVE
+
+    archive = base if base is not None else ROOMS_ARCHIVE
+    meta_path = archive / room_id / "meta.yaml"
+    try:
+        with open(meta_path) as f:
+            meta = _yaml.safe_load(f) or {}
+    except Exception:
+        return "unknown"
+    state = meta.get("state")
+    if state == "stopped":
+        return "stopped"
+    if state != "live":
+        return "unknown"
+    # State claims live — cross-check tmux. Session names follow the
+    # ``<tmux_session_prefix>-<profile>`` convention from
+    # RoomConfig.session_for(). The prefix lives in config.yaml; meta
+    # carries only the profile names.
+    profiles = meta.get("profiles") or []
+    prefix = _read_session_prefix(archive / room_id)
+    if not profiles:
+        # Can't probe without profile names; assume live so we don't
+        # flap to broken on a malformed meta.
+        return "live"
+    any_alive = False
+    for profile in profiles:
+        session = f"{prefix}-{profile}"
+        try:
+            res = subprocess.run(
+                ["tmux", "has-session", "-t", session],
+                capture_output=True,
+            )
+        except FileNotFoundError:
+            # tmux not installed — can't probe; treat as live.
+            return "live"
+        if res.returncode == 0:
+            any_alive = True
+            break
+    return "live" if any_alive else "broken"
+
+
+def _read_session_prefix(room_dir: Path) -> str:
+    """Resolve the tmux session prefix for one room.
+
+    Reads ``config.yaml`` and pulls
+    ``config.config.tmux_session_prefix``. Falls back to ``"room"`` —
+    the RoomConfig default — when the file is missing or malformed,
+    which keeps the lifecycle probe useful even when config.yaml is
+    in flux.
+    """
+    import yaml as _yaml
+
+    config_path = room_dir / "config.yaml"
+    try:
+        with open(config_path) as f:
+            data = _yaml.safe_load(f) or {}
+    except Exception:
+        return "room"
+    cfg = (data.get("config") or {})
+    return cfg.get("tmux_session_prefix") or "room"

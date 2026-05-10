@@ -24,6 +24,7 @@ import subprocess
 import time
 import yaml
 import shutil
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -42,21 +43,70 @@ DIM = "\033[2m"
 BOLD = "\033[1m"
 NC = "\033[0m"
 
-# Config
+# Filesystem locations (path constants — not user-tunable; they live outside
+# RoomConfig because they're the same for every room on a given host).
+# ROOM_DIR is the transient working dir for FIFO/JSONL turn channels and
+# pager scratch files; the persistent per-room archive lives under
+# ~/.ccoral/rooms/<id>/ (Task 3.2).
 ROOM_DIR = Path("/tmp/ccoral-room")
 ROOMS_ARCHIVE = Path.home() / ".ccoral" / "rooms"
 TEMP_PROFILES_DIR = Path.home() / ".ccoral" / "profiles"
-TMUX_SESSION = "room"
-BASE_PORT = 8090
-USER_NAME = "CASSIUS"
 
 # Phase 2: arbiter loop tick. Short timeout on select(); the loop is push-driven
 # (FIFO bytes wake us instantly), the timeout only governs how often we poll
 # stdin via the cockpit's own line-editor and check stall expiry.
 RELAY_SELECT_TIMEOUT = 0.25
-# Phase 2: backpressure defaults. Phase 3 will make these CLI-configurable.
-BACKPRESSURE_TURNS_DEFAULT = 2
-BACKPRESSURE_TIMEOUT_DEFAULT = 60.0
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Phase 3: RoomConfig
+# ───────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class RoomConfig:
+    """Resolved-at-start configuration for one `ccoral room` invocation.
+
+    Replaces the module-level USER_NAME / BASE_PORT / TMUX_SESSION constants
+    of Phases 1+2. Populated by the CLI dispatcher in `ccoral`; threaded
+    through start_proxies/setup_tmux/relay_loop so two rooms can run
+    side-by-side on different ports without env-var gymnastics.
+
+    Defaults preserve pre-Phase-3 behavior exactly: `ccoral room blank blank`
+    with no flags resolves to user=CASSIUS, port=8090, tmux session prefix
+    "room", header-line envelopes, FIFO-or-JSONL channel auto-detect.
+    """
+
+    user_name: str = "CASSIUS"
+    base_port: int = 8090
+    tmux_session_prefix: str = "room"           # actual session: f"{prefix}-{profile}"
+    turn_limit: int | None = None
+    max_chars_per_turn: int | None = None
+    backpressure_turns: int = 2
+    backpressure_timeout_s: float = 60.0
+    seed1: str | None = None
+    seed2: str | None = None
+    moderator: str | None = None                # profile name; optional 3rd pane
+    moderator_cadence: int = 4
+    channel: str = "auto"                       # auto | fifo | jsonl
+    envelope_format: str = "header-line"        # header-line | legacy
+    room_id: str | None = None                  # set at start; per-room state dir key
+
+    def session_for(self, profile: str) -> str:
+        """tmux session name for a given profile in this room."""
+        return f"{self.tmux_session_prefix}-{profile}"
+
+
+# Backward-compat aliases — pre-Phase-3 call sites still reference these
+# module-level names. Sourced from RoomConfig() defaults so the dataclass is
+# the single source of truth. Removed once Phase 3 threads RoomConfig through
+# start_proxies / setup_tmux / relay_loop / cmd_room.
+_DEFAULT_ROOM_CONFIG = RoomConfig()
+USER_NAME = _DEFAULT_ROOM_CONFIG.user_name
+BASE_PORT = _DEFAULT_ROOM_CONFIG.base_port
+TMUX_SESSION = _DEFAULT_ROOM_CONFIG.tmux_session_prefix
+BACKPRESSURE_TURNS_DEFAULT = _DEFAULT_ROOM_CONFIG.backpressure_turns
+BACKPRESSURE_TIMEOUT_DEFAULT = _DEFAULT_ROOM_CONFIG.backpressure_timeout_s
 
 
 def get_display_name(profile_name: str) -> str:

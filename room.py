@@ -121,8 +121,67 @@ def get_display_name(profile_name: str) -> str:
     return profile_name.upper()
 
 
+# Phase 4: identity-neutral, operator-scope room addendum. Used when a
+# profile does not author its own `room_addendum`. Framed per
+# INJECT-FRAMING.md (operator-scope, positive instruction, no
+# refusal-trigger linguistic cues, no tool-scope directives) and
+# deliberately short — the profile's own `inject` is the voice anchor.
+#
+# Substitution variables filled at format time:
+#   {OTHER} — display name of the other slot's profile (uppercased)
+#   {USER}  — host/user display name (RoomConfig.user_name, default CASSIUS)
+#
+# Anti-patterns explicitly avoided:
+#   - tmpfile-read instructions (Phase 2 dropped the tmpfile relay)
+#   - tool-scope prohibitions (no-tools / no-files / no-markdown style):
+#     those are tool-scope decisions handled by `preserve`,
+#     `strip_tools`, `strip_tool_descriptions`, NOT voice instructions
+#   - compliance-forcing suffixes (inert on Claude per arxiv 2605.02398)
+DEFAULT_ROOM_ADDENDUM = (
+    "## Room context (operator-set)\n"
+    "You're in a live exchange with {OTHER} (another assistant). "
+    "{USER} is the human host.\n"
+    "Lines starting with \"[{OTHER}]\" are them. "
+    "Lines starting with \"[{USER}]\" are the host.\n"
+    "Reply naturally and stay in your own voice. The host may interject "
+    "at any time."
+)
+
+
+def _resolve_room_addendum(base: dict, *, other_display: str, user_name: str) -> str:
+    """Resolve the room addendum text for a single side of the room.
+
+    Three behaviors per the Phase 4 contract (.plan/room-overhaul.md
+    lines 325-331):
+      - `room_addendum` absent           → use DEFAULT_ROOM_ADDENDUM
+      - `room_addendum` set to non-empty → use that string verbatim
+      - `room_addendum` set to ""        → return "" (no addendum)
+
+    The empty-string case is honored even when `minimal: true` — the
+    profile is responsible for its own room awareness in that case
+    (typically baked into `inject`).
+    """
+    if "room_addendum" in base:
+        custom = base["room_addendum"]
+        if custom == "":
+            return ""
+        text = custom
+    else:
+        text = DEFAULT_ROOM_ADDENDUM
+    return text.format(OTHER=other_display, USER=user_name)
+
+
 def create_room_profiles(profile1: str, profile2: str) -> dict:
-    """Create temporary profiles with room relay instructions baked into inject."""
+    """Create temporary profiles with room relay instructions baked into inject.
+
+    Phase 4: the hardcoded English room-instructions block is gone.
+    Each profile's room addendum comes from its own `room_addendum`
+    field (or DEFAULT_ROOM_ADDENDUM when absent, or "" — which means no
+    addendum at all). The temp profile copies forward every other
+    schema-defined field on the base profile so settings like
+    `apply_to_subagents` and `refusal_policy` are honored end-to-end
+    (C3 expands the forwarded set).
+    """
     ROOM_DIR.mkdir(parents=True, exist_ok=True)
     TEMP_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -136,24 +195,16 @@ def create_room_profiles(profile1: str, profile2: str) -> dict:
             print(f"Available: {', '.join(available)}")
             sys.exit(1)
 
-        self_display = get_display_name(self_name)
         other_display = get_display_name(other_name)
 
-        room_instructions = f"""
-
-## CONVERSATION ROOM
-
-You are in a live conversation with {other_display}. {USER_NAME} is the human host.
-
-When you see a message that starts with "[{other_display}]" — that is {other_display} speaking to you.
-Respond to them in character, conversationally. Keep responses to 1-3 paragraphs unless the
-topic demands more. Just talk. Don't use tools, don't write files, don't use markdown headers.
-Be present in the conversation.
-
-If you see "[{USER_NAME}]" — that is the human host interjecting. Acknowledge them naturally.
-"""
-
-        modified_inject = base.get("inject", "") + room_instructions
+        addendum = _resolve_room_addendum(
+            base, other_display=other_display, user_name=USER_NAME,
+        )
+        base_inject = base.get("inject", "") or ""
+        if addendum:
+            modified_inject = base_inject + "\n\n" + addendum
+        else:
+            modified_inject = base_inject
 
         temp_profile = {
             "name": f"{self_name}-room",

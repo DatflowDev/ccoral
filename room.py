@@ -21,6 +21,7 @@ import os
 import select
 import sys
 import subprocess
+import threading
 import time
 import yaml
 import shutil
@@ -1398,6 +1399,257 @@ def _setup_turn_channel(slot: int, profile_name: str) -> tuple[Path, str]:
     return jsonl_path, "jsonl"
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# Phase 6: per-room control FIFO consumer.
+#
+# The sidecars (`ccoral room serve` web POST /say, the upcoming Phase 11
+# multi-room TUI) are out-of-process producers — they need a way to land
+# `{"kind": "say"|"inject", "text": ..., "target": ...}` events into the
+# running cockpit's input channel WITHOUT spawning into the cockpit's
+# tmux session or otherwise stepping on the relay loop.
+#
+# We give each room a dedicated control FIFO at /tmp/ccoral-room/<id>.control
+# and tail it on a background daemon thread. Each parsed JSON line is
+# routed through `room_control._push_input` — exactly the same surface
+# `RoomApp.dispatch_command` uses for keyboard input. The relay loop's
+# `read_command(timeout=0)` drain (room.py around line 1935) sees no
+# difference between a key press and a sidecar interjection, which is
+# the whole point: Phase 11 will reuse this contract verbatim from the
+# multi-room TUI.
+#
+# Anti-pattern guards baked in:
+#   - mkfifo failure (unsupported FS, macOS edge cases per plan line 730)
+#     falls back to JSONL append-only with a byte cursor. The producer
+#     doesn't care which path is live — `write_control_event` resolves
+#     both via the same path lookup helper below.
+#   - The tail thread blocks on `os.read` from the FIFO so we don't
+#     spin the CPU waiting on idle producers; the JSONL fallback uses
+#     a 100ms poll which is plenty for human-typed input.
+#   - Cleanup is idempotent: stop() can be called multiple times, and
+#     the FIFO node is unlinked on stop so the next room launch with
+#     the same id (impossible in practice — id has a timestamp — but
+#     cheap to be defensive) starts clean.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def control_path_for(room_id: str) -> Path:
+    """Resolve the control sink path for a room id.
+
+    FIFO when supported (the common case on Linux), `.control.jsonl`
+    fallback when the FIFO node could not be created. Producers
+    (sidecars) call this to discover where to write — they don't need
+    to know which kind is live, they just open-write-close.
+    """
+    fifo = ROOM_DIR / f"{room_id}.control"
+    jsonl = ROOM_DIR / f"{room_id}.control.jsonl"
+    # Prefer the live FIFO; fall back to JSONL if the consumer chose it.
+    if fifo.exists():
+        return fifo
+    if jsonl.exists():
+        return jsonl
+    return fifo  # Default for callers that want to create.
+
+
+def write_control_event(room_id: str, event: dict) -> None:
+    """Producer-side helper. Append one JSON line to the control sink.
+
+    Open-write-close per event is fine for human-paced sidecar traffic
+    and means the producer never holds an FD between calls. The line
+    terminator is a single newline so the consumer's line-buffered
+    reader picks it up atomically (well below PIPE_BUF for any
+    reasonable text payload).
+    """
+    path = control_path_for(room_id)
+    line = json.dumps(event, ensure_ascii=False) + "\n"
+    # Open in non-blocking write mode for FIFOs so a producer doesn't
+    # hang forever when the consumer hasn't started yet (or has crashed).
+    # For JSONL, plain append is fine.
+    if path.suffix == ".control":
+        # FIFO write — open with O_NONBLOCK so a missing reader fails fast
+        # rather than blocking the sidecar.
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            # No reader attached — drop the event. The sidecar logs;
+            # the cockpit isn't listening so there's nothing to deliver.
+            raise
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+    else:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
+class ControlFifo:
+    """Per-room control sink consumer.
+
+    Opens (or falls back from) a FIFO at /tmp/ccoral-room/<id>.control,
+    spawns a daemon thread that reads JSON lines and routes them
+    through `room_app._push_input`. Lifecycle: `start()` at room boot,
+    `stop()` in run_room's `finally` block. Both are safe to call
+    repeatedly.
+
+    The router function defaults to `room_app._push_input` (the input
+    channel the Phase 9 cockpit's keyboard dispatcher feeds), but the
+    test suite overrides it so we can assert routing without spinning
+    a full RoomApp.
+    """
+
+    def __init__(self, room_id: str, *,
+                 router: "Callable[[tuple], None] | None" = None):
+        self.room_id = room_id
+        self.path: Path = ROOM_DIR / f"{room_id}.control"
+        self.kind: str = "fifo"  # "fifo" | "jsonl"
+        self._thread: "threading.Thread | None" = None
+        self._stop = threading.Event()
+        # Late import to avoid a hard dep when room.py is imported by
+        # tooling that doesn't need the cockpit (e.g. export-only paths).
+        if router is None:
+            import room_app
+            router = room_app._push_input
+        self._router = router
+
+    def start(self) -> None:
+        """Create the sink, spawn the consumer thread."""
+        ROOM_DIR.mkdir(parents=True, exist_ok=True)
+        # Clear any stale node from a previous run with this id.
+        for stale in (ROOM_DIR / f"{self.room_id}.control",
+                      ROOM_DIR / f"{self.room_id}.control.jsonl"):
+            try:
+                stale.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            os.mkfifo(str(self.path), 0o600)
+            self.kind = "fifo"
+        except (OSError, NotImplementedError):
+            # Per plan line 730: macOS / odd-FS fallback. Use a JSONL
+            # file with a byte cursor instead. Sidecars discover this
+            # via control_path_for().
+            self.path = ROOM_DIR / f"{self.room_id}.control.jsonl"
+            self.path.touch()
+            self.kind = "jsonl"
+
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name=f"ccoral-control-{self.room_id}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, *, timeout: float = 1.0) -> None:
+        """Signal the consumer thread, unlink the sink."""
+        self._stop.set()
+        # The FIFO read blocks; nudge it by opening a write end so the
+        # reader returns and notices _stop. Same trick the proxy uses
+        # to unblock its select on shutdown.
+        if self.kind == "fifo" and self.path.exists():
+            try:
+                fd = os.open(str(self.path), os.O_WRONLY | os.O_NONBLOCK)
+                os.close(fd)
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+    # ─── internal ────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        if self.kind == "fifo":
+            self._run_fifo()
+        else:
+            self._run_jsonl()
+
+    def _run_fifo(self) -> None:
+        """Block on FIFO reads in a tight loop. Each open returns when
+        a writer connects + writes; on writer close, read returns "" so
+        we re-open and wait for the next sidecar message.
+        """
+        buf = b""
+        while not self._stop.is_set():
+            try:
+                # Blocking open + read. The unblocker in stop() opens
+                # the write end so this loop ticks past _stop on shutdown.
+                with open(self.path, "rb", buffering=0) as f:
+                    while not self._stop.is_set():
+                        chunk = f.read(4096)
+                        if not chunk:
+                            # Writer closed; re-open to wait for the next.
+                            break
+                        buf += chunk
+                        buf = self._drain_buffer(buf)
+            except (OSError, ValueError):
+                # FIFO unlinked (stop()) or transient error — exit.
+                return
+
+    def _run_jsonl(self) -> None:
+        """Poll the JSONL fallback with a byte cursor. 100ms tick."""
+        cursor = 0
+        while not self._stop.is_set():
+            try:
+                size = self.path.stat().st_size
+            except FileNotFoundError:
+                return
+            if size > cursor:
+                try:
+                    with open(self.path, "rb") as f:
+                        f.seek(cursor)
+                        chunk = f.read(size - cursor)
+                except OSError:
+                    return
+                cursor = size
+                self._drain_buffer(chunk)
+            self._stop.wait(0.1)
+
+    def _drain_buffer(self, buf: bytes) -> bytes:
+        """Split buf on newlines, dispatch complete lines, return remainder."""
+        out_remainder = b""
+        # Split keeping any trailing partial line for the next read.
+        lines = buf.split(b"\n")
+        out_remainder = lines[-1]
+        for raw in lines[:-1]:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            self._dispatch_line(line)
+        return out_remainder
+
+    def _dispatch_line(self, line: str) -> None:
+        """Parse one JSON line, translate to a dispatch tuple, route it."""
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict):
+            return
+        kind = payload.get("kind")
+        text = payload.get("text", "")
+        if kind == "say":
+            event = ("say", text)
+        elif kind == "inject":
+            target = payload.get("target", "")
+            if not target:
+                return
+            event = ("inject", target, text)
+        else:
+            # Unknown kind — silently drop. Forward-compatible: a future
+            # sidecar might emit kinds this consumer doesn't grok yet.
+            return
+        try:
+            self._router(event)
+        except Exception:
+            # The router lives in room_app; a transient failure there
+            # must not kill the consumer thread.
+            pass
+
+
 def relay_loop(profile1: str, profile2: str, topic: str = None,
                prior_messages: list = None,
                channels: dict | None = None,
@@ -2482,6 +2734,14 @@ def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None
     state.write_initial()
     print(f"{DIM}State dir: {state.dir}{NC}")
 
+    # Phase 6: per-room control FIFO consumer. Sidecars (room serve, the
+    # Phase 11 multi-room TUI) write JSON lines here; the consumer routes
+    # each one through room_app's input channel so the relay loop sees
+    # them as if the operator had typed them at the cockpit.
+    control = ControlFifo(room_id)
+    control.start()
+    print(f"{DIM}Control sink: {control.path} ({control.kind}){NC}")
+
     messages: list = []
     exit_reason = "clean"
     try:
@@ -2512,6 +2772,14 @@ def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None
         # the contract the C6 tests assert against.
         state.update_exit(exit_reason)
         print(f"{DIM}Meta stamped: state=stopped exit_reason={exit_reason}{NC}")
+
+        # Phase 6: tear down the control sink consumer + unlink the FIFO.
+        # Done before stop_proxies so a sidecar that races us doesn't see
+        # a torn-down proxy with a still-live control sink.
+        try:
+            control.stop()
+        except Exception as e:
+            print(f"{DIM}Control sink cleanup: {e}{NC}")
 
         # Stop proxies
         stop_proxies(procs)

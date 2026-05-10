@@ -102,15 +102,39 @@ def strip_message_tags(body: dict, profile: dict) -> int:
     in the conversation, downstream summarizers may reproduce it.
 
     Block-type filter:
-      - text          → strip (both roles)
-      - tool_result   → strip nested content (user-side only in practice)
-      - tool_use      → skipped (structured, no free text)
-      - thinking      → skipped (modifying invalidates the signature; the
-                        elevation risk is low because the model reads its
-                        own thinking as scratch, not as harness signal)
-      - image / other → skipped
+      - text              → strip (both roles)
+      - tool_result       → strip nested content (user-side only in practice)
+      - tool_use          → skipped (structured JSON input, no free-text
+                            field where a reminder could meaningfully live)
+      - thinking          → skipped — protocol constraint, not preference.
+                            Anthropic's API requires thinking blocks to be
+                            replayed UNCHANGED in multi-turn conversations
+                            using tool use. The full reasoning is encrypted
+                            in the `signature` field; the `thinking` text
+                            is empty by default (`display: omitted` on
+                            Opus 4.7+) or a server-summarized excerpt.
+                            Editing thinking text invalidates the signature
+                            (API rejects on replay). Dropping the block
+                            breaks tool_use → tool_result continuity. The
+                            "strip everywhere" principle still holds, but
+                            the safe enforcement point for thinking content
+                            is the conversation summarizer's prompt
+                            (lane-router work, Phase 5) — anything the
+                            summarizer extracts from thinking gets sanitized
+                            before it lands in compaction history.
+      - redacted_thinking → skipped — same protocol constraint. Encrypted
+                            content lives in the `data` field; block must be
+                            replayed unchanged. Per Anthropic docs:
+                            "Filtering on block.type == 'thinking' alone
+                            silently drops redacted_thinking blocks and
+                            breaks the multi-turn protocol."
+      - image / other     → skipped
 
     Returns the number of tags stripped.
+
+    Refs:
+      - https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
+        (replay rules, signature semantics, redacted_thinking handling)
     """
     preserve = set(profile.get("preserve", []))
 

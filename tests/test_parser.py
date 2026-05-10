@@ -110,7 +110,12 @@ def test_strip_message_tags_cross_role():
                     }
                 ],
             },
-            # Assistant thinking — must NOT strip (signature stays valid)
+            # Assistant thinking — must NOT strip. Anthropic protocol
+            # requires thinking blocks be replayed unchanged during tool-use
+            # multi-turn flows; modifying invalidates the signature, dropping
+            # breaks tool_use→tool_result continuity. Reminder text inside
+            # thinking is a real leak path but the safe fix point is the
+            # conversation summarizer (Phase 5), not the request-side strip.
             {
                 "role": "assistant",
                 "content": [
@@ -120,6 +125,20 @@ def test_strip_message_tags_cross_role():
                         "signature": "abc123",
                     },
                     {"type": "text", "text": "visible answer"},
+                ],
+            },
+            # Assistant redacted_thinking — must NOT strip. Encrypted content
+            # in `data` field, same protocol constraint. Per Anthropic docs:
+            # "Filtering on block.type == 'thinking' alone silently drops
+            # redacted_thinking blocks and breaks the multi-turn protocol."
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "redacted_thinking",
+                        "data": "Eo8FCkYICRgCKkBopaque",
+                    },
+                    {"type": "text", "text": "another visible answer"},
                 ],
             },
         ]
@@ -140,11 +159,18 @@ def test_strip_message_tags_cross_role():
     assert "<system-reminder>" not in msgs[2]["content"][0]["content"], (
         "tool_result not stripped"
     )
-    # Thinking preserved
+    # Thinking preserved (protocol requires unchanged replay)
     assert "<system-reminder>" in msgs[3]["content"][0]["thinking"], (
-        "thinking block was modified — would invalidate signature"
+        "thinking block was modified — would invalidate signature, break replay"
     )
     assert msgs[3]["content"][0]["signature"] == "abc123", "signature mutated"
+    # redacted_thinking preserved (same protocol constraint)
+    assert msgs[4]["content"][0]["type"] == "redacted_thinking", (
+        "redacted_thinking block was dropped — would break multi-turn protocol"
+    )
+    assert msgs[4]["content"][0]["data"] == "Eo8FCkYICRgCKkBopaque", (
+        "redacted_thinking data field was modified"
+    )
     print("test_strip_message_tags_cross_role: OK")
 
 

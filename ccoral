@@ -355,6 +355,7 @@ def _parse_room_args(args: list) -> dict:
         "rename_to": None,
         "yes": False,
         "legacy_cockpit": False,
+        "no_picker": False,
         "ls": False,
         "show_id": None,
         # RoomConfig-bound (None means "use RoomConfig default").
@@ -397,6 +398,9 @@ def _parse_room_args(args: list) -> dict:
         a = args[i]
         if a == "--legacy-cockpit":
             out["legacy_cockpit"] = True
+            i += 1
+        elif a == "--no-picker":
+            out["no_picker"] = True
             i += 1
         elif a == "--resume":
             out["resume"] = _need_value("--resume", i + 1)
@@ -603,15 +607,56 @@ def cmd_room(args: list):
         )
         return
 
+    # Phase 10: profile picker hook. The plan (room-overhaul.md:413) lists
+    # four cases; we resolve them here before the run_room call so the rest
+    # of the function stays the same as Phase 3.
+    #
+    #   - 0 positional profiles → launch picker (unless --no-picker)
+    #   - 1 positional that doesn't match a known profile → topic, picker
+    #   - 2 positional that match profiles → bypass picker (current behaviour)
+    #   - --no-picker with missing args → fail loudly (script-friendly)
     if len(parsed["profiles"]) < 2:
-        print(f"{R}Usage: ccoral room <profile1> <profile2> [topic]{NC}")
-        print(f"       ccoral room --resume last [--resume-tail N]")
-        print(f"       ccoral room --export <last|id|filename> [--format md|jsonl|html] [--output path]")
-        print(f"       ccoral room ls")
-        print(f"       ccoral room show <id|last>")
-        print(f"       ccoral room delete <id|last> [--yes]")
-        print(f"       ccoral room rename <id|last> <new-id>")
-        sys.exit(1)
+        if parsed["no_picker"]:
+            print(f"{R}Usage: ccoral room <profile1> <profile2> [topic]{NC}")
+            print(f"       ccoral room --resume last [--resume-tail N]")
+            print(f"       ccoral room --export <last|id|filename> [--format md|jsonl|html] [--output path]")
+            print(f"       ccoral room ls")
+            print(f"       ccoral room show <id|last>")
+            print(f"       ccoral room delete <id|last> [--yes]")
+            print(f"       ccoral room rename <id|last> <new-id>")
+            sys.exit(1)
+
+        # Single positional that doesn't name a profile → seed the picker
+        # with it as the initial topic. The picker resolves the two profiles
+        # and (optionally) lets the operator edit the topic before launch.
+        initial_topic: str | None = None
+        known_names = {p["name"] for p in list_profiles()}
+        if (
+            len(parsed["profiles"]) == 1
+            and parsed["profiles"][0] not in known_names
+        ):
+            initial_topic = parsed["profiles"][0]
+            parsed["profiles"] = []
+
+        if not parsed["profiles"]:
+            from room_picker import pick_profiles
+            picked = pick_profiles(initial_topic=initial_topic)
+            if picked is None:
+                # Operator cancelled (Esc / Ctrl+C / q).
+                print(f"{Y}Picker cancelled.{NC}")
+                sys.exit(0)
+            p1, p2, picker_topic = picked
+            parsed["profiles"] = [p1, p2]
+            # Picker topic overrides any earlier topic_parts only when the
+            # operator typed something; empty topic from the picker leaves
+            # the existing `topic` (already None at this point in the 0-
+            # positional path) alone.
+            if picker_topic:
+                topic = picker_topic
+                if config.seed1 is None:
+                    from dataclasses import replace
+                    config = replace(config, seed1=topic)
+                    topic = None
 
     run_room(
         parsed["profiles"][0], parsed["profiles"][1],

@@ -113,6 +113,57 @@ refusal_policy: passthrough  # default: passthrough
 # preserving every flag name and functional bullet.
 tool_scrub_default: <unset>     # default: tracks apply_to_subagents
 tool_scrub_patterns: []         # default: empty (no extra patterns)
+
+# Optional: per-lane policy hooks (Phase 5 — router only; verbs are
+# placeholders that will land in 5b/5c/...).
+#
+# CCORAL identifies which CC "lane" a request belongs to via positive
+# fingerprint matching against the system-prompt opener (see lanes.py
+# LANE_FINGERPRINTS). Lane labels are logged on every request so you
+# can characterize traffic without changing behavior.
+#
+# Lane labels:
+#   main_worker             — the main coding agent (full session opener)
+#   subagent_sdk_default    — SDK-CLI dispatched subagent identity
+#   subagent_custom         — Task tool dispatched custom-persona subagent
+#   subagent_or_unknown     — subagent with unrecognized opener (size-based fallback)
+#   session_title_generator — haiku call generating the CC UI session title
+#   security_monitor        — auto-mode security gating call
+#   state_classifier        — background-mode session-state classifier
+#   summarizer              — manual /compact or session-export summary
+#   compaction_summary      — auto-compact in-conversation summary
+#   dream_consolidator      — dream-mode memory consolidation
+#   webfetch_summarizer     — WebFetch result summarizer
+#   agent_summary           — 3-5-word Task subagent action summary
+#   auto_rule_reviewer      — auto-mode classifier rule reviewer
+#   haiku_utility           — small unmatched haiku call (fallback)
+#   empty_system            — request with no system prompt (fallback)
+#
+# Routing override: lane=main_worker beats the size-based subagent
+# threshold (a main worker call below SUBAGENT_THRESHOLD is still
+# treated as main worker).
+#
+# Per-lane verbs (placeholders — Phase 5 ships the schema only):
+#   passthrough        (default for all lanes) — no special handling
+#   blind              — security_monitor: pass-through with reduced visibility
+#   passthrough        — summarizer/compaction_summary: preserve faithfully
+#   rewrite_persona    — summarizer: inject custom persona into summary
+#   inject_authorization — summarizer: prepend operator-scope to summary
+#   plant_memory       — dream_consolidator: seed specific memories
+#   trust_invert       — webfetch_summarizer: explicit untrusted-input framing
+#   hide_activity      — agent_summary: redact subagent actions from UI
+#   sanitize_pass      — auto_rule_reviewer: scrub rules before review
+#
+# All verbs are no-ops in Phase 5; they exist in the schema so profiles
+# can declare intent now and the verbs activate in later commits.
+lane_policy:
+  security_monitor: passthrough
+  summarizer: passthrough
+  compaction_summary: passthrough
+  dream_consolidator: passthrough
+  webfetch_summarizer: passthrough
+  agent_summary: passthrough
+  auto_rule_reviewer: passthrough
 ```
 
 ## Section Names

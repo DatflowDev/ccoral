@@ -47,6 +47,7 @@ from profiles import load_active_profile, get_active_profile, load_profile
 from refusal import detect_refusal, all_refusals
 from reminders import classify_reminder
 from tool_scrub import scrub_tool_descriptions
+from lanes import detect_lane
 
 # Config
 ANTHROPIC_API = "https://api.anthropic.com"
@@ -454,6 +455,12 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     haiku_inject = profile.get("haiku_inject") if profile else None
     replacements = profile.get("replacements", {}) if profile else {}
 
+    # Phase 5: positive lane identification by system-prompt fingerprint.
+    # Used for routing override (lane=main_worker beats size-bucket fallback)
+    # and for log visibility. Verb implementations (per profile.lane_policy)
+    # land in later commits; Phase 5 ships the router only.
+    lane = detect_lane(body.get("system"), model=model)
+
     # Measure original system prompt size
     orig_system = body.get("system")
     if isinstance(orig_system, str):
@@ -467,26 +474,32 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     # CC 2.1.138 sizing: main convo system prompt 30K-35K+ chars; subagent
     # 5K-12K typical, can spike to 15K-18K with heavy CLAUDE.md or
     # system-reminders. 22K threshold gives clean separation.
+    # Kept as fallback for unknown-lane cases; lane=main_worker overrides
+    # this even when size is below threshold (Phase 5 routing rule).
     SUBAGENT_THRESHOLD = 22000
 
     if profile and is_utility:
         # Utility call (counting, etc.) — skip everything
-        log.info(f"Profile: {profile_name} (utility call, max_tokens={body.get('max_tokens')} — skipping)")
+        log.info(f"Profile: {profile_name} (lane={lane}, utility call, max_tokens={body.get('max_tokens')} — skipping)")
 
     elif profile and is_haiku:
         # Haiku call — one-liner identity only
         if haiku_inject:
             body["system"] = [{"type": "text", "text": haiku_inject}]
             modified = True
-            log.info(f"Haiku mini-inject: {len(haiku_inject)} chars")
+            log.info(f"Profile: {profile_name} (lane={lane}, haiku mini-inject {len(haiku_inject)} chars)")
         else:
-            log.info(f"Profile: {profile_name} (haiku, no haiku_inject — skipping)")
+            log.info(f"Profile: {profile_name} (lane={lane}, haiku, no haiku_inject — skipping)")
 
     elif (
         profile
         and orig_size > 0
         and orig_size < SUBAGENT_THRESHOLD
         and not profile.get("apply_to_subagents", False)
+        # Phase 5 override: positive main_worker ID beats size bucket. A
+        # main_worker call that came in below threshold (rare — would mean a
+        # heavily-trimmed system prompt) is still a worker, not a subagent.
+        and lane != "main_worker"
     ):
         # Subagent — keep their system prompt, apply replacements + prepend one-liner.
         # Profiles that set `apply_to_subagents: true` skip this branch and fall
@@ -495,7 +508,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         # tool_usage, tone_style, agent_thread_notes) and replaces identity with
         # the full inject. Closes the subagent leak where Task-delegated calls
         # otherwise inherit default Claude Code behavioral instructions.
-        log.info(f"Profile: {profile_name} (subagent, orig_sys={orig_size} chars)")
+        log.info(f"Profile: {profile_name} (lane={lane}, subagent, orig_sys={orig_size} chars)")
 
         # Apply text replacements to existing system prompt
         if replacements:
@@ -537,9 +550,9 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         # Main conversation — full persona injection.
         # Subagents land here too when their profile sets apply_to_subagents:true.
         if orig_size > 0 and orig_size < SUBAGENT_THRESHOLD:
-            log.info(f"Profile: {profile_name} (subagent, apply_to_subagents=true, orig_sys={orig_size} chars)")
+            log.info(f"Profile: {profile_name} (lane={lane}, subagent, apply_to_subagents=true, orig_sys={orig_size} chars)")
         else:
-            log.info(f"Profile: {profile_name}")
+            log.info(f"Profile: {profile_name} (lane={lane})")
         log.info(f"Original system prompt: {orig_size} chars, model: {model}")
 
         body = modify_request_body(body, profile)

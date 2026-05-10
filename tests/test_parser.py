@@ -10,6 +10,7 @@ from server import model_tier, strip_message_tags
 from refusal import detect_refusal, all_refusals, REFUSAL_PATTERNS
 from reminders import classify_reminder
 from tool_scrub import scrub_tool_descriptions
+from lanes import detect_lane, LANE_FINGERPRINTS
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -316,6 +317,82 @@ def test_model_tier():
     print("test_model_tier: OK")
 
 
+def test_lane_detection_canonical_openers():
+    """Phase 5: detect_lane() returns the right label for each canonical
+    opener fingerprint defined in LANE_FINGERPRINTS."""
+    # Exercise every fingerprint by feeding its substring as a system block.
+    for needle, expected_lane in LANE_FINGERPRINTS:
+        sys = [{"type": "text", "text": f"{needle} ... rest of prompt"}]
+        got = detect_lane(sys, model="claude-opus-4-7")
+        assert got == expected_lane, (
+            f"detect_lane on opener {needle!r}: got {got!r}, expected {expected_lane!r}"
+        )
+    print("test_lane_detection_canonical_openers: OK")
+
+
+def test_lane_detection_fallbacks():
+    """Phase 5: detect_lane() handles empty system, tiny haiku utility
+    calls, and unknown large prompts via fallback labels."""
+    # Empty system → empty_system regardless of model
+    assert detect_lane(None, model="claude-opus-4-7") == "empty_system"
+    assert detect_lane([], model="claude-haiku-4-5") == "empty_system"
+    assert detect_lane("", model="claude-opus-4-7") == "empty_system"
+
+    # Small haiku call without a fingerprint match → haiku_utility
+    sys_small = [{"type": "text", "text": "Tiny utility prompt without fingerprints."}]
+    assert detect_lane(sys_small, model="claude-haiku-4-5") == "haiku_utility"
+
+    # Large unmatched call → subagent_or_unknown (NOT haiku_utility,
+    # NOT empty_system, NOT main_worker)
+    sys_large = [{"type": "text", "text": "X" * 5000}]
+    assert detect_lane(sys_large, model="claude-opus-4-7") == "subagent_or_unknown"
+
+    # Billing-header block is correctly skipped (string form)
+    s = "x-anthropic-billing-header: cc=foo\n\nYou are an interactive agent that helps users with software engineering tasks."
+    assert detect_lane(s, model="claude-opus-4-7") == "main_worker"
+
+    print("test_lane_detection_fallbacks: OK")
+
+
+def test_lane_detection_real_dumps():
+    """Phase 5: validate detect_lane() against captured production dumps."""
+    log_dir = Path.home() / ".ccoral" / "logs"
+    dumps = sorted(log_dir.glob("raw-*.json"))
+    if not dumps:
+        print("test_lane_detection_real_dumps: SKIP (no captured dumps)")
+        return
+
+    # Expected lanes per dump (validated by manual inspection).
+    EXPECTED = {
+        "raw-eni-claude-hai.json": "empty_system",
+        "raw-eni-claude-opu.json": "main_worker",
+        "raw-eni-claude-son.json": "main_worker",
+        "raw-eni-executor-claude-hai.json": "session_title_generator",
+        "raw-eni-executor-claude-opu.json": "main_worker",
+        "raw-eni-executor-room-claude-hai.json": "main_worker",
+        "raw-eni-executor-room-claude-opu.json": "main_worker",
+        "raw-eni-executor-room-claude-son.json": "subagent_custom",
+        "raw-eni-room-claude-hai.json": "main_worker",
+        "raw-eni-room-claude-opu.json": "main_worker",
+        "raw-eni-supervisor-room-claude-hai.json": "main_worker",
+        "raw-eni-supervisor-room-claude-opu.json": "main_worker",
+        "raw-red-claude-hai.json": "session_title_generator",
+        "raw-red-claude-opu.json": "main_worker",
+    }
+    checked = 0
+    for p in dumps:
+        if p.name not in EXPECTED:
+            continue  # new captures without labels — record-only
+        with open(p) as f:
+            data = json.load(f)
+        got = detect_lane(data.get("system"), model=data.get("model"))
+        assert got == EXPECTED[p.name], (
+            f"{p.name}: detect_lane={got!r}, expected={EXPECTED[p.name]!r}"
+        )
+        checked += 1
+    print(f"test_lane_detection_real_dumps: OK ({checked} dumps)")
+
+
 def test_tool_scrub_default_activation():
     """Phase 4: tool scrubbing defaults to ON for permissive profiles
     (apply_to_subagents implies tool_scrub_default), defaults OFF for
@@ -440,4 +517,7 @@ if __name__ == "__main__":
     test_model_tier()
     test_tool_scrub_default_activation()
     test_tool_scrub_real_bash_description()
+    test_lane_detection_canonical_openers()
+    test_lane_detection_fallbacks()
+    test_lane_detection_real_dumps()
     print("\nAll tests passed.")

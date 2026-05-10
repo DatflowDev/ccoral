@@ -1,0 +1,25 @@
+/* Phase 9 — Textual cockpit stylesheet. Mirrors the Phase 1 ANSI palette
+ * (Y / C / W / DIM) so the new cockpit reads the same as the bespoke
+ * split-screen for operators with muscle memory. CSS-only; no raw ANSI
+ * lives in room_app.py — anti-pattern grep `\\\\033\\[` must stay 0. */
+
+#transcript {
+    height: 1fr;
+    border: round $primary;
+    padding: 0 1;
+}
+
+#prompt {
+    dock: bottom;
+    height: 3;
+    border: round $accent;
+}
+
+/* Speaker classes used via Rich markup (e.g. [yellow]CASSIUS[/yellow]).
+ * Kept as CSS classes too so future widgets (status line, badges) can
+ * pick up the same colors without re-encoding the palette. */
+.speaker-1 { color: yellow; }
+.speaker-2 { color: cyan; }
+.system    { color: $text-muted; }
+.warn      { color: orange; }
+.host      { color: white; text-style: bold; }

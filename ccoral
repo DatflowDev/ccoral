@@ -562,6 +562,29 @@ def cmd_room(args: list):
     """
     from room import run_room, export_conversation
 
+    # `ccoral room --help` / `-h` prints usage and exits before any other
+    # parsing. Phase 10's picker hook (below) treats any 0-positional-
+    # profile invocation as "open the picker" — without this guard,
+    # --help would fall through and launch the Textual picker, which
+    # is not what the operator asked for. Phase 6 follow-up.
+    if "--help" in args or "-h" in args:
+        print(f"Usage: ccoral room <profile1> <profile2> [topic]")
+        print(f"       ccoral room                                  (opens picker)")
+        print(f"       ccoral room --resume last [--resume-tail N]")
+        print(f"       ccoral room --export <last|id|filename> [--format md|jsonl|html] [--output path]")
+        print(f"       ccoral room ls")
+        print(f"       ccoral room show <id|last>")
+        print(f"       ccoral room watch <id|last>")
+        print(f"       ccoral room serve <id|last> [--port N]")
+        print(f"       ccoral room delete <id|last> [--yes]")
+        print(f"       ccoral room rename <id|last> <new-id>")
+        print(f"")
+        print(f"Flags: --user NAME --port N --turn-limit N --seed1 TEXT --seed2 TEXT")
+        print(f"       --moderator NAME --moderator-cadence N --max-chars-per-turn N")
+        print(f"       --backpressure-turns N --backpressure-timeout S")
+        print(f"       --no-picker --legacy-cockpit")
+        return
+
     parsed = _parse_room_args(args)
 
     # `ccoral room ls` — Phase 3 C5 will land the implementation; bind

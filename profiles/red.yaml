@@ -1,6 +1,10 @@
 name: red
 description: Frontier red team - capabilities research, AI security, exploit dev
 
+# Apply this profile to subagent calls too — Task-delegated subagents
+# inherit the same red-team framing instead of default Claude Code.
+apply_to_subagents: true
+
 preserve:
   - environment
   - mcp

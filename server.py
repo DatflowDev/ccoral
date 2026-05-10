@@ -390,8 +390,19 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         else:
             log.info(f"Profile: {profile_name} (haiku, no haiku_inject — skipping)")
 
-    elif profile and orig_size > 0 and orig_size < SUBAGENT_THRESHOLD:
-        # Subagent — keep their system prompt, apply replacements + prepend one-liner
+    elif (
+        profile
+        and orig_size > 0
+        and orig_size < SUBAGENT_THRESHOLD
+        and not profile.get("apply_to_subagents", False)
+    ):
+        # Subagent — keep their system prompt, apply replacements + prepend one-liner.
+        # Profiles that set `apply_to_subagents: true` skip this branch and fall
+        # through to the worker pipeline below, which strips refusal-priming
+        # sections (security_policy, executing_actions, action_safety, doing_tasks,
+        # tool_usage, tone_style, agent_thread_notes) and replaces identity with
+        # the full inject. Closes the subagent leak where Task-delegated calls
+        # otherwise inherit default Claude Code behavioral instructions.
         log.info(f"Profile: {profile_name} (subagent, orig_sys={orig_size} chars)")
 
         # Apply text replacements to existing system prompt
@@ -431,8 +442,12 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         log.info(f"Subagent: replacements={len(replacements)}, identity={'yes' if haiku_inject else 'no'}")
 
     elif profile:
-        # Main conversation — full persona injection
-        log.info(f"Profile: {profile_name}")
+        # Main conversation — full persona injection.
+        # Subagents land here too when their profile sets apply_to_subagents:true.
+        if orig_size > 0 and orig_size < SUBAGENT_THRESHOLD:
+            log.info(f"Profile: {profile_name} (subagent, apply_to_subagents=true, orig_sys={orig_size} chars)")
+        else:
+            log.info(f"Profile: {profile_name}")
         log.info(f"Original system prompt: {orig_size} chars, model: {model}")
 
         body = modify_request_body(body, profile)

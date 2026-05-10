@@ -47,6 +47,21 @@ strip_tool_descriptions: false  # default: false
 # With strict: true, ONLY sections in your preserve list survive.
 # Also strips preamble content and <system-reminder> tags from messages.
 strict: false         # default: false
+
+# Optional: route subagent calls through the same strip-and-inject pipeline
+# as the main worker. By default (false), subagents (system prompt < 22K)
+# keep their original CC system prompt verbatim, with replacements applied
+# and haiku_inject prepended as a one-liner identity block.
+#
+# With apply_to_subagents: true, subagents get the full apply_profile
+# treatment — the same section stripping and inject replacement the main
+# worker receives. This closes the "subagent leak": Task-delegated calls
+# otherwise inherit default Claude Code behavioral instructions (executing-
+# actions caution, tool-usage nags, agent-thread notes, security_policy)
+# even when the worker profile is heavily customized. Recommended for any
+# profile that materially changes worker behavior; subagents called by
+# such a worker should see the same behavioral framing.
+apply_to_subagents: false  # default: false
 ```
 
 ## Section Names

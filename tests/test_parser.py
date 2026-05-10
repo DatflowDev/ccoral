@@ -55,6 +55,35 @@ def test_apply_profile_main():
     print("test_apply_profile_main: OK")
 
 
+def test_apply_profile_subagent_fixture():
+    """When apply_to_subagents=true, server.py dispatch routes subagent calls
+    through modify_request_body → apply_profile, the same pipeline used for
+    the main worker. Verify the building block: apply_profile on the subagent
+    fixture replaces identity with inject and strips agent_thread_notes."""
+    data = json.loads((FIXTURES / "subagent-2.1.138.json").read_text())
+    blocks = parse_system_prompt(data["system"])
+    profile = {
+        "inject": "You are Vonnegut. Stay in character.",
+        "preserve": ["environment", "current_date", "claude_md"],
+    }
+    blocks = apply_profile(blocks, profile)
+    out = rebuild_system_prompt(blocks)
+    text = "\n".join(b.get("text", "") for b in out)
+    # Inject replaced identity
+    assert "You are Vonnegut" in text, "inject text missing"
+    # Original subagent identity opener replaced
+    assert "You are an agent for Claude Code" not in text, (
+        "default subagent identity not stripped"
+    )
+    # Agent-thread notes section stripped (cwd-reset/no-emoji guidance)
+    assert "Agent threads always have their cwd reset" not in text, (
+        "agent_thread_notes not stripped"
+    )
+    # Environment section survived (it's in preserve)
+    assert "Working directory" in text, "environment section was incorrectly stripped"
+    print("test_apply_profile_subagent_fixture: OK")
+
+
 def test_model_tier():
     cases = [
         ("claude-opus-4-7", "opus"),
@@ -76,5 +105,6 @@ if __name__ == "__main__":
     test_main_fixture()
     test_subagent_fixture()
     test_apply_profile_main()
+    test_apply_profile_subagent_fixture()
     test_model_tier()
     print("\nAll tests passed.")

@@ -826,8 +826,17 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
     # the Textual RoomApp. The closure that follows closes over this
     # local binding, so the swap is total. One-release safety net only;
     # Phase 12 deletes the flag and the legacy module.
+    #
+    # The `import ... as room_control` inside the if-branch makes
+    # `room_control` a function-local for the whole function (Python
+    # lexical-scope rule), shadowing the module-level `import room_app
+    # as room_control`. Both branches must rebind, or the False path
+    # leaves the local unbound and every later call raises
+    # UnboundLocalError. (Phase 9 follow-up; bug surfaced 2026-05-10.)
     if legacy_cockpit:
         import room_control_legacy as room_control  # noqa: F811
+    else:
+        import room_app as room_control  # noqa: F811
 
     if channels is None:
         # Late binding for callers that didn't pre-create channels. This

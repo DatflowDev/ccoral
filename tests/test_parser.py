@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from parser import parse_system_prompt, apply_profile, rebuild_system_prompt
-from server import model_tier
+from server import model_tier, strip_message_tags
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -84,6 +84,70 @@ def test_apply_profile_subagent_fixture():
     print("test_apply_profile_subagent_fixture: OK")
 
 
+def test_strip_message_tags_cross_role():
+    """Verify <system-reminder> stripping walks both user and assistant text,
+    skips tool_use blocks, and leaves thinking-block signatures intact."""
+    body = {
+        "messages": [
+            # User text (string content) — must strip
+            {"role": "user", "content": "hello <system-reminder>nag</system-reminder> world"},
+            # Assistant text block — must strip (this is the Phase 2 fix)
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "ok <system-reminder>echoed</system-reminder> done"},
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+                ],
+            },
+            # User tool_result — must strip
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": "stdout <system-reminder>nag2</system-reminder> end",
+                    }
+                ],
+            },
+            # Assistant thinking — must NOT strip (signature stays valid)
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "internal <system-reminder>preserved</system-reminder> note",
+                        "signature": "abc123",
+                    },
+                    {"type": "text", "text": "visible answer"},
+                ],
+            },
+        ]
+    }
+    count = strip_message_tags(body, {})
+    assert count == 3, f"expected 3 strips (user-string, assistant-text, tool_result), got {count}"
+
+    msgs = body["messages"]
+    # User string
+    assert "<system-reminder>" not in msgs[0]["content"], "user string not stripped"
+    # Assistant text block
+    assert "<system-reminder>" not in msgs[1]["content"][0]["text"], (
+        "assistant text not stripped (Phase 2 leak)"
+    )
+    # tool_use block untouched
+    assert msgs[1]["content"][1]["type"] == "tool_use", "tool_use mangled"
+    # tool_result
+    assert "<system-reminder>" not in msgs[2]["content"][0]["content"], (
+        "tool_result not stripped"
+    )
+    # Thinking preserved
+    assert "<system-reminder>" in msgs[3]["content"][0]["thinking"], (
+        "thinking block was modified — would invalidate signature"
+    )
+    assert msgs[3]["content"][0]["signature"] == "abc123", "signature mutated"
+    print("test_strip_message_tags_cross_role: OK")
+
+
 def test_model_tier():
     cases = [
         ("claude-opus-4-7", "opus"),
@@ -106,5 +170,6 @@ if __name__ == "__main__":
     test_subagent_fixture()
     test_apply_profile_main()
     test_apply_profile_subagent_fixture()
+    test_strip_message_tags_cross_role()
     test_model_tier()
     print("\nAll tests passed.")

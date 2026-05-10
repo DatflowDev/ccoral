@@ -88,10 +88,27 @@ def model_tier(model: str | None) -> str:
 
 def strip_message_tags(body: dict, profile: dict) -> int:
     """
-    Strip <system-reminder> tags from the messages array.
+    Strip <system-reminder> tags from the messages array, across all roles.
 
-    These tags inject dynamic behavioral rules into user messages and
-    change per-request, causing cache misses. v1 did this; v2 didn't.
+    These tags inject dynamic behavioral rules and change per-request,
+    causing cache misses. v1 did this; v2 didn't.
+
+    Walks user AND assistant messages. Assistant-side stripping closes
+    the leak where reminder-shaped fragments echoed by the model (e.g.,
+    quoting tool output in its own response) survive into compaction
+    summaries and persist across sessions. The harness only injects
+    reminders on the user side, but the model has no role-aware reading
+    of tag-shape — once `<system-reminder>` literal text lives anywhere
+    in the conversation, downstream summarizers may reproduce it.
+
+    Block-type filter:
+      - text          → strip (both roles)
+      - tool_result   → strip nested content (user-side only in practice)
+      - tool_use      → skipped (structured, no free text)
+      - thinking      → skipped (modifying invalidates the signature; the
+                        elevation risk is low because the model reads its
+                        own thinking as scratch, not as harness signal)
+      - image / other → skipped
 
     Returns the number of tags stripped.
     """
@@ -105,9 +122,6 @@ def strip_message_tags(body: dict, profile: dict) -> int:
     total_stripped = 0
 
     for msg in messages:
-        if msg.get("role") != "user":
-            continue
-
         content = msg.get("content")
         if isinstance(content, str):
             cleaned, count = _SYSTEM_REMINDER_RE.subn("", content)
@@ -116,15 +130,16 @@ def strip_message_tags(body: dict, profile: dict) -> int:
                 msg["content"] = cleaned if cleaned.strip() else "."
                 total_stripped += count
         elif isinstance(content, list):
-            # Content blocks. Two shapes we care about:
-            #   {"type": "text", "text": "..."}           — plain user text
-            #   {"type": "tool_result", "content": ...}   — tool output returned
-            #     to the model. `content` is usually a string, occasionally a
-            #     list of sub-blocks [{"type": "text", "text": "..."}, ...].
-            # Reminders get injected into BOTH shapes. The original version
-            # only handled type=="text", so tool_result reminders (the common
-            # case: nag injected after every tool call) passed through
-            # unstripped.
+            # Content blocks. Three shapes we care about:
+            #   {"type": "text", "text": "..."}           — text from either role
+            #   {"type": "tool_result", "content": ...}   — user-side tool output
+            #     returned to the model. `content` is usually a string,
+            #     occasionally a list of sub-blocks [{"type": "text", ...}, ...].
+            #   {"type": "tool_use" | "thinking" | ...}   — skipped, see docstring.
+            # Reminders get injected into text/tool_result shapes. v1 of this
+            # function only handled type=="text" and only on user messages,
+            # leaving (a) tool_result reminders unstripped and (b) any
+            # assistant-side reminder echo unstripped — both fixed now.
             blocks_to_remove = []
             for i, block in enumerate(content):
                 if not isinstance(block, dict):

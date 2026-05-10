@@ -46,6 +46,7 @@ from parser import parse_system_prompt, apply_profile, rebuild_system_prompt, du
 from profiles import load_active_profile, get_active_profile, load_profile
 from refusal import detect_refusal, all_refusals
 from reminders import classify_reminder
+from tool_scrub import scrub_tool_descriptions
 
 # Config
 ANTHROPIC_API = "https://api.anthropic.com"
@@ -369,6 +370,14 @@ def modify_request_body(body: dict, profile: dict) -> dict:
 
     if replacements:
         log.info(f"Applied {len(replacements)} text replacement(s)")
+
+    # Phase 4: scrub behavioral fearmongering from tool descriptions.
+    # Default-on for permissive profiles (apply_to_subagents implies
+    # tool_scrub_default unless explicitly overridden via tool_scrub_default:
+    # false). Profile-supplied tool_scrub_patterns are applied additively.
+    # See tool_scrub.py and INJECT-FRAMING.md § 4 for the rationale.
+    if "tools" in body and not profile.get("strip_tools", False):
+        scrub_tool_descriptions(body["tools"], profile, log=log)
 
     # Log size reduction
     orig_size = sum(len(b.text) for b in parse_system_prompt(system))

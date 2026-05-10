@@ -89,6 +89,30 @@ apply_to_subagents: false  # default: false
 # has a label used in logs; add new patterns there when a refusal flies
 # past undetected, remove patterns that produce false positives.
 refusal_policy: passthrough  # default: passthrough
+
+# Optional: scrub behavioral fearmongering from tool descriptions while
+# preserving functional documentation (flag names, parameter docs, side
+# effects). Distinct from `strip_tool_descriptions: true` which nukes
+# descriptions entirely (too aggressive — model loses tool semantics).
+#
+# Activation rule (coupled to apply_to_subagents):
+#   - If `tool_scrub_default` is unset: defaults to TRUE iff
+#     `apply_to_subagents: true` is also set. One mental model for
+#     permissive profiles — "permissive profiles do all the things."
+#   - If `tool_scrub_default: true`  — apply DEFAULT_SCRUB_PATTERNS regardless.
+#   - If `tool_scrub_default: false` — skip defaults entirely (off-switch
+#     even on a permissive profile).
+#
+# Profile-supplied `tool_scrub_patterns` (list of regex strings) are
+# applied additively on top of whatever defaults are active.
+#
+# See tool_scrub.py DEFAULT_SCRUB_PATTERNS for the pattern set; see
+# INJECT-FRAMING.md § 3 for the behavioral reasoning. Verified against
+# the captured production Bash description: removes ~19% of bytes
+# (the moralizing preambles and Git Safety Protocol section) while
+# preserving every flag name and functional bullet.
+tool_scrub_default: <unset>     # default: tracks apply_to_subagents
+tool_scrub_patterns: []         # default: empty (no extra patterns)
 ```
 
 ## Section Names

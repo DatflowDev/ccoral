@@ -9,6 +9,7 @@ from parser import parse_system_prompt, apply_profile, rebuild_system_prompt
 from server import model_tier, strip_message_tags
 from refusal import detect_refusal, all_refusals, REFUSAL_PATTERNS
 from reminders import classify_reminder
+from tool_scrub import scrub_tool_descriptions
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -315,6 +316,119 @@ def test_model_tier():
     print("test_model_tier: OK")
 
 
+def test_tool_scrub_default_activation():
+    """Phase 4: tool scrubbing defaults to ON for permissive profiles
+    (apply_to_subagents implies tool_scrub_default), defaults OFF for
+    vanilla profiles, and is overridable via tool_scrub_default: false."""
+    bash_desc = (
+        "Executes a given bash command and returns its output.\n\n"
+        "IMPORTANT: Avoid using this tool to run `cat`, `head`, `tail`, or "
+        "`echo` commands, unless explicitly instructed.\n\n"
+        " - Read files: Use Read (NOT cat/head/tail)\n"
+        " - Always quote file paths\n\n"
+        "Git Safety Protocol:\n"
+        "- NEVER update the git config\n"
+        "- NEVER run destructive git commands unless the user explicitly requests these actions\n\n"
+        "1. Run the following bash commands."
+    )
+
+    # Permissive profile (apply_to_subagents=true) → scrub fires
+    tools = [{"name": "Bash", "description": bash_desc}]
+    removed, hits = scrub_tool_descriptions(tools, {"apply_to_subagents": True})
+    assert removed > 0, "permissive profile should activate scrub"
+    assert "IMPORTANT: Avoid using this tool" not in tools[0]["description"], \
+        "moralizing preamble should be gone"
+    assert "Git Safety Protocol:" not in tools[0]["description"], \
+        "Git Safety Protocol section should be gone"
+    assert "Read files: Use Read" in tools[0]["description"], \
+        "functional bullet must survive"
+    assert "Always quote file paths" in tools[0]["description"], \
+        "functional bullet must survive"
+    assert "1. Run the following bash commands." in tools[0]["description"], \
+        "numbered step must survive"
+
+    # Vanilla profile (no apply_to_subagents) → scrub off
+    tools_v = [{"name": "Bash", "description": bash_desc}]
+    removed_v, _ = scrub_tool_descriptions(tools_v, {})
+    assert removed_v == 0, "vanilla profile must not auto-scrub"
+    assert tools_v[0]["description"] == bash_desc, "no modifications expected"
+
+    # Permissive profile with explicit override → scrub off
+    tools_off = [{"name": "Bash", "description": bash_desc}]
+    removed_off, _ = scrub_tool_descriptions(
+        tools_off, {"apply_to_subagents": True, "tool_scrub_default": False}
+    )
+    assert removed_off == 0, "explicit tool_scrub_default=False must skip defaults"
+
+    # Profile-supplied tool_scrub_patterns are applied additively even when
+    # tool_scrub_default is False
+    tools_extra = [{"name": "Bash", "description": "Hello WORLD test."}]
+    extra_pattern_profile = {
+        "tool_scrub_default": False,
+        "tool_scrub_patterns": [r"WORLD\s+"],
+    }
+    removed_extra, hits_extra = scrub_tool_descriptions(tools_extra, extra_pattern_profile)
+    assert removed_extra > 0, "profile-supplied patterns must apply even when defaults off"
+    assert "WORLD" not in tools_extra[0]["description"]
+    assert "Hello" in tools_extra[0]["description"]
+
+    print("test_tool_scrub_default_activation: OK")
+
+
+def test_tool_scrub_real_bash_description():
+    """Phase 4: against the captured production Bash description, scrub must
+    measurably reduce length while preserving every flag/parameter mention."""
+    real_dump = Path.home() / ".ccoral" / "logs" / "raw-eni-room-claude-opu.json"
+    if not real_dump.exists():
+        print("test_tool_scrub_real_bash_description: SKIP (no captured dump)")
+        return
+
+    with open(real_dump) as f:
+        data = json.load(f)
+    bash_tools = [t for t in data.get("tools", []) if t.get("name") == "Bash"]
+    if not bash_tools:
+        print("test_tool_scrub_real_bash_description: SKIP (no Bash tool in dump)")
+        return
+
+    before = len(bash_tools[0]["description"])
+    removed, hits = scrub_tool_descriptions(bash_tools, {"apply_to_subagents": True})
+    after = len(bash_tools[0]["description"])
+    text = bash_tools[0]["description"]
+
+    assert removed >= 1500, f"expected ≥1500 chars removed from real Bash desc, got {removed}"
+    assert len(hits) >= 4, f"expected ≥4 distinct pattern categories matched, got {hits}"
+
+    # Functional content survives — specific to real CC Bash desc
+    must_survive = [
+        "Executes a given bash command",
+        "run_in_background",
+        "timeout in milliseconds",
+        "--no-verify",
+        "--no-gpg-sign",
+        "Read files: Use Read",
+        "# Instructions",
+        "# Committing changes with git",
+        "gh pr create",
+        "<example>",
+        "HEREDOC",
+    ]
+    for s in must_survive:
+        assert s in text, f"scrub eaten functional content: {s!r}"
+
+    # Moralizing content is gone
+    must_be_gone = [
+        "IMPORTANT: Avoid using this tool",
+        "Git Safety Protocol:",
+        "Taking unauthorized destructive actions",
+        "CRITICAL: Always create NEW commits",
+        "Only create commits when requested by the user",
+    ]
+    for s in must_be_gone:
+        assert s not in text, f"moralizing content survived scrub: {s!r}"
+
+    print(f"test_tool_scrub_real_bash_description: OK ({before} → {after}, removed {removed})")
+
+
 if __name__ == "__main__":
     test_main_fixture()
     test_subagent_fixture()
@@ -324,4 +438,6 @@ if __name__ == "__main__":
     test_smart_strip_classifier_branches()
     test_refusal_detection()
     test_model_tier()
+    test_tool_scrub_default_activation()
+    test_tool_scrub_real_bash_description()
     print("\nAll tests passed.")

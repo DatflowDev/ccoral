@@ -1,0 +1,44 @@
+/* Phase 11 — Multi-room cockpit stylesheet.
+ *
+ * Mirrors room_app.tcss colors so muscle memory carries over from the
+ * single-room cockpit and the watch sidecar (yellow / cyan / muted). The
+ * tabs strip + per-room RichLog is laid out via Textual's CSS Grid; we
+ * dock the prompt to the bottom and let TabbedContent take the rest. No
+ * raw ANSI in rooms_cockpit.py — anti-pattern grep `\\\\033\\[` stays 0.
+ */
+
+#tabs {
+    height: 1fr;
+}
+
+RichLog {
+    border: round $primary;
+    padding: 0 1;
+}
+
+#unified-log {
+    height: 1fr;
+    border: round $accent;
+    padding: 0 1;
+}
+
+#prompt {
+    dock: bottom;
+    height: 3;
+    border: round $accent;
+}
+
+.hidden {
+    display: none;
+}
+
+/* Speaker classes — same palette as room_app.tcss so a per-room line
+ * rendered in the cockpit looks identical to the same line in
+ * `ccoral room watch`. */
+.speaker-1 { color: yellow; }
+.speaker-2 { color: cyan; }
+.system    { color: $text-muted; }
+.warn      { color: orange; }
+.host      { color: white; text-style: bold; }
+.broken    { color: red; text-style: bold; }
+.stopped   { color: $text-muted; text-style: italic; }

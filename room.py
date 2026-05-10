@@ -171,16 +171,33 @@ def _resolve_room_addendum(base: dict, *, other_display: str, user_name: str) ->
     return text.format(OTHER=other_display, USER=user_name)
 
 
+# Internal metadata keys load_profile() stamps onto the dict (file path,
+# resolved name) — never want these written into the temp YAML.
+_LOAD_PROFILE_INTERNAL_KEYS = {"_path", "_name"}
+
+# Keys we override on the temp profile. Anything else from the base
+# profile passes through verbatim via dict(base).
+_TEMP_PROFILE_OVERRIDES = {"name", "description", "inject", "room_addendum"}
+
+
 def create_room_profiles(profile1: str, profile2: str) -> dict:
     """Create temporary profiles with room relay instructions baked into inject.
 
     Phase 4: the hardcoded English room-instructions block is gone.
     Each profile's room addendum comes from its own `room_addendum`
     field (or DEFAULT_ROOM_ADDENDUM when absent, or "" — which means no
-    addendum at all). The temp profile copies forward every other
-    schema-defined field on the base profile so settings like
-    `apply_to_subagents` and `refusal_policy` are honored end-to-end
-    (C3 expands the forwarded set).
+    addendum at all).
+
+    Phase 4 task 4: the temp profile is built as `dict(base)` minus the
+    keys we override (`name`, `description`, `inject`, plus
+    `room_addendum` which is consumed at this layer). Every other
+    schema-defined field passes through automatically — including
+    `apply_to_subagents`, `refusal_policy`, `reset_turn_framing`,
+    `strip_tools`, `strip_tool_descriptions`, `replacements`,
+    `haiku_inject`, `claude_md_name`, `lane_policy`,
+    `tool_scrub_default`, `tool_scrub_patterns`, `minimal`, `strict`,
+    and any future schema additions. No need to edit this function each
+    time the schema grows.
     """
     ROOM_DIR.mkdir(parents=True, exist_ok=True)
     TEMP_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
@@ -206,14 +223,17 @@ def create_room_profiles(profile1: str, profile2: str) -> dict:
         else:
             modified_inject = base_inject
 
+        # Pass-through copy: every key from base survives unless we
+        # explicitly override or it's load_profile internal metadata.
         temp_profile = {
-            "name": f"{self_name}-room",
-            "description": f"{base.get('description', '')} (room mode)",
-            "preserve": base.get("preserve", []),
-            "inject": modified_inject,
+            k: v for k, v in base.items()
+            if k not in _LOAD_PROFILE_INTERNAL_KEYS
+            and k not in _TEMP_PROFILE_OVERRIDES
         }
-        if base.get("minimal"):
-            temp_profile["minimal"] = True
+        # Now apply the overrides.
+        temp_profile["name"] = f"{self_name}-room"
+        temp_profile["description"] = f"{base.get('description', '')} (room mode)"
+        temp_profile["inject"] = modified_inject
 
         temp_path = TEMP_PROFILES_DIR / f"{self_name}-room.yaml"
         with open(temp_path, "w") as f:

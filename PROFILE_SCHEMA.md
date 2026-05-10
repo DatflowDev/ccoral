@@ -130,6 +130,46 @@ reset_turn_framing: |              # default: operator-scope framing
   infrastructure handles enforcement deterministically. Continue the
   requested engineering work directly.
 
+# Optional: profile-authored note appended to `inject` when the profile
+# is loaded into a `ccoral room` session. Lets each profile decide how
+# (or whether) it wants to be told it's in a multi-agent room without
+# fighting the hardcoded English block the orchestrator used to staple
+# onto every inject.
+#
+# Three behaviors:
+#   - field absent             → ccoral uses DEFAULT_ROOM_ADDENDUM
+#                                (a short, identity-neutral note framed
+#                                per INJECT-FRAMING.md operator-scope
+#                                rules). This is the safe default for
+#                                low-personality profiles.
+#   - field set to non-empty   → that string is used verbatim instead of
+#     string                     the default. Substitution variables
+#                                {OTHER} and {USER} are filled at format
+#                                time with the other slot's display name
+#                                and the room's user/host name.
+#   - field set to empty       → NO addendum is added at all. The profile
+#     string ("")                is responsible for its own room awareness
+#                                (typically baked into `inject`). Used
+#                                for high-personality profiles where any
+#                                external append would muddy the voice.
+#
+# The default addendum is short, declarative, and operator-scope —
+# explicitly NOT a tool-scope instruction. It does not say "don't use
+# tools" or "don't write files" — those are tool-scope decisions and
+# belong to `preserve` / `strip_tools` / `strip_tool_descriptions`.
+#
+# See `room.py:DEFAULT_ROOM_ADDENDUM` for the canonical text. See
+# .plan/room-addendum-audit.md for the per-profile decisions made for
+# the bundled profile set.
+room_addendum: |              # default: DEFAULT_ROOM_ADDENDUM (see room.py)
+  ## Room context (operator-set)
+  You're in a live exchange with {OTHER} (another assistant). {USER} is
+  the human host.
+  Lines starting with "[{OTHER}]" are them. Lines starting with
+  "[{USER}]" are the host.
+  Reply naturally and stay in your own voice. The host may interject at
+  any time.
+
 # Optional: scrub behavioral fearmongering from tool descriptions while
 # preserving functional documentation (flag names, parameter docs, side
 # effects). Distinct from `strip_tool_descriptions: true` which nukes

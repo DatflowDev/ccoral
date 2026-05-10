@@ -237,21 +237,29 @@ def send_to_pane(session: str, message: str):
 def pane_for_profile(panes: dict, target: str):
     """Resolve `/to <target>` to a session name.
 
-    Accepts either the bare profile name ("blank") or the per-pane suffix
-    ("blank-1", "blank-2") that the plan's verification commands use. If
-    no match, returns None.
+    Accepts the bare profile name ("blank"), the per-pane suffix
+    ("blank-1", "blank-2") that the plan's verification commands use, or
+    the bare digits "1"/"2". Match is case-insensitive across all forms,
+    so `/to BLANK-1` resolves the same as `/to blank-1`. Returns None on
+    no match.
     """
     if target in panes:
         return panes[target]
-    # `<profile>-1` / `<profile>-2` short forms.
     keys = list(panes.keys())
-    if target == f"{keys[0]}-1" or target == "1":
+    # Bare digits.
+    if target == "1":
         return panes[keys[0]]
-    if len(keys) > 1 and (target == f"{keys[1]}-2" or target == "2"):
+    if len(keys) > 1 and target == "2":
         return panes[keys[1]]
-    # Case-insensitive fallback.
+    # `<profile>-1` / `<profile>-2`, case-insensitive on the prefix.
+    tlow = target.lower()
+    if tlow == f"{keys[0].lower()}-1":
+        return panes[keys[0]]
+    if len(keys) > 1 and tlow == f"{keys[1].lower()}-2":
+        return panes[keys[1]]
+    # Plain case-insensitive name match.
     for k, v in panes.items():
-        if k.lower() == target.lower():
+        if k.lower() == tlow:
             return v
     return None
 
@@ -306,9 +314,6 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
       0.1 = bottom-left (control)
       0.2 = right (profile2 Claude)
     """
-    p1_display = get_display_name(profile1)
-    p2_display = get_display_name(profile2)
-
     # Response file paths
     p1_file = ROOM_DIR / f"{profile1}_response.txt"
     p2_file = ROOM_DIR / f"{profile2}_response.txt"
@@ -426,19 +431,49 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
             send_to_pane(sess, f"[{USER_NAME}] {text}")
 
         def _open_transcript_pager() -> None:
-            """Spawn `less -R` on the live transcript file."""
+            """Spawn `less -R` on the live transcript file.
+
+            Three-step dance: tear the cockpit down, page, set it back up.
+            The risky window is the re-setup — if it raises, the cockpit
+            is gone and `render_transcript_line` would write into a bare
+            terminal. In that case we log to plain stderr and ask the
+            relay loop to drain after the in-flight turn so the user's
+            session still saves cleanly instead of running into a void.
+            """
+            nonlocal end_after_turn
             tmp = ROOM_DIR / "transcript.live.txt"
             try:
                 with open(tmp, "w") as fh:
                     for m in messages:
                         fh.write(f"{m.get('name', '?')}: {m.get('text', '')}\n\n")
-                room_control.teardown_split_screen()
-                subprocess.run(["less", "-R", str(tmp)])
-                room_control.setup_split_screen()
             except Exception as e:
                 room_control.render_transcript_line(
-                    "ROOM", f"transcript pager failed: {e}", DIM,
+                    "ROOM", f"transcript pager failed (write): {e}", DIM,
                 )
+                return
+
+            room_control.teardown_split_screen()
+            try:
+                subprocess.run(["less", "-R", str(tmp)])
+            except Exception as e:
+                # Pager itself blew up; cockpit is already torn down. Try
+                # to bring it back so we can surface the error inline. If
+                # that fails too the next try/except below handles it.
+                sys.stderr.write(f"\nccoral: less failed: {e}\n")
+                sys.stderr.flush()
+
+            try:
+                room_control.setup_split_screen()
+            except Exception as e:
+                # Cockpit failed to re-arm. Terminal is bare; do NOT call
+                # render_transcript_line (it would no-op-ish to stdout).
+                # Save and exit cleanly after the in-flight turn.
+                sys.stderr.write(
+                    f"\nccoral: cockpit re-entry failed: {e}\n"
+                    f"ccoral: ending after in-flight turn — session will save.\n",
+                )
+                sys.stderr.flush()
+                end_after_turn = True
 
         def _dispatch(event: tuple) -> bool:
             """Dispatch a user event. Returns True if the loop should keep
@@ -613,12 +648,6 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
     return messages
 
 
-def log_to_control(message: str):
-    """Print a message to the control area (stdout of this script)."""
-    # Truncate for display
-    print(f"  {message}")
-
-
 def export_conversation(resume: str, output: str = None) -> Path:
     """Export a saved conversation to clean markdown.
 
@@ -646,9 +675,6 @@ def export_conversation(resume: str, output: str = None) -> Path:
     except Exception:
         date_str = started[:10] if started else "Unknown date"
         time_str = ""
-
-    p1_display = get_display_name(profiles[0])
-    p2_display = get_display_name(profiles[1])
 
     lines = []
     lines.append(f"# {profiles[0].title()} \u00d7 {profiles[1].title()}")

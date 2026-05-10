@@ -47,6 +47,7 @@ We deliberately do not use curses — the relay loop already shells out to
 tmux + subprocess and we don't want to fight curses for terminal control.
 """
 
+import atexit
 import os
 import select
 import shutil
@@ -67,11 +68,9 @@ NC = "\033[0m"
 # ANSI control
 ALT_SCREEN_ON = "\033[?1049h"
 ALT_SCREEN_OFF = "\033[?1049l"
-CURSOR_HOME = "\033[H"
 CLEAR_SCREEN = "\033[2J"
 CLEAR_LINE = "\033[2K"
 SHOW_CURSOR = "\033[?25h"
-HIDE_CURSOR = "\033[?25l"
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +96,14 @@ _prompt_row = 24      # input prompt
 # Saved tty state for clean restore.
 _saved_tty_attrs = None
 _split_active = False
+
+# Saved signal handlers so teardown can put them back.
+_saved_sigterm_handler = None
+_saved_sigwinch_handler = None
+
+# Ensure the atexit hook is only registered once across setup/teardown cycles
+# (e.g. /transcript re-entry calls setup again).
+_atexit_registered = False
 
 # Transcript scroll cursor — next free row inside the transcript region.
 _transcript_cursor = 1
@@ -192,14 +199,30 @@ def _on_winch(signum, frame) -> None:
 # Split-screen lifecycle
 # ---------------------------------------------------------------------------
 
+def _on_sigterm(signum, frame) -> None:
+    """SIGTERM handler — restore the terminal, then re-raise the default.
+
+    Without this, `kill <pid>` leaves the user inside the alt screen with
+    cbreak mode and a narrow scroll region. After teardown we reinstall
+    the default disposition and re-send SIGTERM to ourselves so the
+    process actually exits.
+    """
+    try:
+        teardown_split_screen()
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+
 def setup_split_screen() -> None:
     """Enter alt screen, set scroll region, put terminal in cbreak mode.
 
-    Idempotent only in the sense that calling it twice is a programmer
-    error — pair with `teardown_split_screen()` via the `split_screen()`
-    context manager below.
+    Safe to call after a teardown (e.g. `/transcript` re-entry). The
+    teardown_split_screen counterpart is idempotent — the `_split_active`
+    flag plus a singleton atexit hook guarantees we never double-restore.
     """
     global _saved_tty_attrs, _split_active, _transcript_cursor
+    global _saved_sigterm_handler, _saved_sigwinch_handler, _atexit_registered
 
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         # No TTY → fall back to plain stdout. setup is a no-op so the
@@ -225,19 +248,42 @@ def setup_split_screen() -> None:
     sys.stdout.flush()
 
     try:
-        signal.signal(signal.SIGWINCH, _on_winch)
+        _saved_sigwinch_handler = signal.signal(signal.SIGWINCH, _on_winch)
     except (ValueError, OSError):
-        pass
+        _saved_sigwinch_handler = None
+
+    # Install SIGTERM handler so `kill <pid>` doesn't strand the user in
+    # the alt screen. Saved so teardown can put the prior one back.
+    try:
+        _saved_sigterm_handler = signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError):
+        _saved_sigterm_handler = None
+
+    # atexit is the belt to the SIGTERM/finally suspenders — if anything
+    # bypasses normal control flow (subprocess crash, os._exit, etc.) the
+    # interpreter shutdown still puts the terminal back. Register once.
+    if not _atexit_registered:
+        atexit.register(teardown_split_screen)
+        _atexit_registered = True
 
     _split_active = True
 
 
 def teardown_split_screen() -> None:
-    """Restore terminal: clear region, leave alt screen, restore tty."""
-    global _split_active
+    """Restore terminal: clear region, leave alt screen, restore tty.
+
+    Idempotent — the `_split_active` flag short-circuits repeat calls so
+    the SIGINT `finally`, the SIGTERM handler, and the atexit hook can
+    all fire without double-restoring (which would clobber the user's
+    real terminal state with stale saved values).
+    """
+    global _split_active, _saved_sigterm_handler, _saved_sigwinch_handler
 
     if not _split_active:
         return
+    # Flip the flag first so any re-entrant call (atexit while we're
+    # mid-teardown) becomes a no-op.
+    _split_active = False
 
     try:
         _clear_scroll_region()
@@ -253,12 +299,26 @@ def teardown_split_screen() -> None:
         except (termios.error, OSError):
             pass
 
+    # Restore the prior signal handlers (or fall back to defaults).
     try:
-        signal.signal(signal.SIGWINCH, signal.SIG_DFL)
+        signal.signal(
+            signal.SIGWINCH,
+            _saved_sigwinch_handler if _saved_sigwinch_handler is not None
+            else signal.SIG_DFL,
+        )
     except (ValueError, OSError):
         pass
+    _saved_sigwinch_handler = None
 
-    _split_active = False
+    try:
+        signal.signal(
+            signal.SIGTERM,
+            _saved_sigterm_handler if _saved_sigterm_handler is not None
+            else signal.SIG_DFL,
+        )
+    except (ValueError, OSError):
+        pass
+    _saved_sigterm_handler = None
 
 
 @contextmanager

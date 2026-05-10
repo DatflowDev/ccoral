@@ -178,11 +178,17 @@ def cleanup_room_profiles(profile1: str, profile2: str):
 def start_proxies(room_profiles: dict, channels: dict | None = None) -> list:
     """Start two CCORAL proxy instances with room profiles.
 
-    `channels`, when provided, maps base_profile_name -> (path, kind). The
+    `channels`, when provided, maps slot int (1 or 2) -> (path, kind). The
     proxy is told to push completed-turn records there via
     `CCORAL_RESPONSE_FIFO` (when kind=="fifo") or `CCORAL_RESPONSE_JSONL`
-    (kind=="jsonl"). When `channels` is None we fall back to the legacy
-    `CCORAL_RESPONSE_FILE` path so non-arbiter callers still work.
+    (kind=="jsonl"). When `channels` is None we fall back to a legacy
+    per-slot `CCORAL_RESPONSE_FILE` path so non-arbiter callers still work.
+
+    Each proxy also gets `CCORAL_ROOM_SLOT=1` or `=2` so server.py can
+    stamp every turn record with its slot identity (Phase 8). Slot is
+    derived from enumeration order over `room_profiles` — the dict
+    insertion order matches (profile1, profile2) at the run_room call
+    site.
     """
     server_path = SCRIPT_DIR / "server.py"
     procs = []
@@ -194,20 +200,23 @@ def start_proxies(room_profiles: dict, channels: dict | None = None) -> list:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     for i, (base_name, room_name) in enumerate(room_profiles.items()):
+        slot = i + 1
         port = BASE_PORT + i
         env = os.environ.copy()
         env["CCORAL_PORT"] = str(port)
         env["CCORAL_PROFILE"] = room_name
+        env["CCORAL_ROOM_SLOT"] = str(slot)
         env["CCORAL_LOG"] = "0"
-        if channels and base_name in channels:
-            ch_path, ch_kind = channels[base_name]
+        if channels and slot in channels:
+            ch_path, ch_kind = channels[slot]
             if ch_kind == "fifo":
                 env["CCORAL_RESPONSE_FIFO"] = str(ch_path)
             else:
                 env["CCORAL_RESPONSE_JSONL"] = str(ch_path)
         else:
-            # Legacy fallback for non-arbiter callers.
-            env["CCORAL_RESPONSE_FILE"] = str(ROOM_DIR / f"{base_name}_response.txt")
+            # Legacy fallback for non-arbiter callers — slot-prefixed so a
+            # `room blank blank` invocation can't collide on the same path.
+            env["CCORAL_RESPONSE_FILE"] = str(ROOM_DIR / f"slot{slot}_{base_name}.txt")
         # Make sure proxies hit the real API, not any existing proxy
         env.pop("ANTHROPIC_BASE_URL", None)
 
@@ -437,33 +446,41 @@ def relay_via_paste_buffer(session: str, text: str, buffer_name: str) -> None:
     )
 
 
-def pane_for_profile(panes: dict, target: str):
+def pane_for_profile(panes: dict, slot_meta: dict, target: str):
     """Resolve `/to <target>` to a session name.
 
-    Accepts the bare profile name ("blank"), the per-pane suffix
-    ("blank-1", "blank-2") that the plan's verification commands use, or
-    the bare digits "1"/"2". Match is case-insensitive across all forms,
-    so `/to BLANK-1` resolves the same as `/to blank-1`. Returns None on
-    no match.
+    Phase 8: `panes` is now slot-keyed ({1: sess1, 2: sess2}); profile
+    name lookups go through `slot_meta` (which carries each slot's
+    profile name). Accepts:
+      - bare profile name ("blank")
+      - bare digits ("1", "2")
+      - per-pane suffix ("blank-1", "blank-2")
+    All matches are case-insensitive. Returns None on no match.
+
+    Note the per-pane-suffix forms are unambiguous about slot even when
+    profile1 == profile2 — `blank-1` always means slot 1.
     """
-    if target in panes:
-        return panes[target]
-    keys = list(panes.keys())
+    tlow = (target or "").lower()
     # Bare digits.
     if target == "1":
-        return panes[keys[0]]
-    if len(keys) > 1 and target == "2":
-        return panes[keys[1]]
-    # `<profile>-1` / `<profile>-2`, case-insensitive on the prefix.
-    tlow = target.lower()
-    if tlow == f"{keys[0].lower()}-1":
-        return panes[keys[0]]
-    if len(keys) > 1 and tlow == f"{keys[1].lower()}-2":
-        return panes[keys[1]]
-    # Plain case-insensitive name match.
-    for k, v in panes.items():
-        if k.lower() == tlow:
-            return v
+        return panes.get(1)
+    if target == "2":
+        return panes.get(2)
+    # `<profile>-1` / `<profile>-2`, slot-explicit, case-insensitive.
+    p1_low = slot_meta[1]["profile"].lower()
+    p2_low = slot_meta[2]["profile"].lower()
+    if tlow == f"{p1_low}-1":
+        return panes.get(1)
+    if tlow == f"{p2_low}-2":
+        return panes.get(2)
+    # Plain profile-name match. If both slots share the profile, slot 1
+    # wins by convention — the operator should use `<name>-2` for the
+    # other side. (This branch is unreachable when distinct profiles
+    # are used, which is the common case.)
+    if tlow == p1_low:
+        return panes.get(1)
+    if tlow == p2_low:
+        return panes.get(2)
     return None
 
 
@@ -714,15 +731,20 @@ class TurnArbiter:
                 self.stalled_until[p] = 0.0
 
 
-def _setup_turn_channel(profile_name: str) -> tuple[Path, str]:
-    """Create the per-profile turn-record channel (FIFO when supported,
+def _setup_turn_channel(slot: int, profile_name: str) -> tuple[Path, str]:
+    """Create the per-slot turn-record channel (FIFO when supported,
     JSONL fallback). Returns (path, channel_kind).
+
+    Phase 8: paths are slot-prefixed (`slot1_<profile>.fifo`) so a
+    duplicate-profile invocation (`ccoral room blank blank`) cannot
+    collide on the same sink. Slot prefix guarantees uniqueness even
+    when both proxies share a base profile name.
 
     Detection rule: try mkfifo; on OSError (ENOTSUP, EPERM, etc.) fall
     back to a writable JSONL path. The orchestrator logs the choice once
     at startup so the operator knows which path is live.
     """
-    fifo_path = ROOM_DIR / f"{profile_name}.fifo"
+    fifo_path = ROOM_DIR / f"slot{slot}_{profile_name}.fifo"
     # Clear any stale node; a previous run's leftover would either be the
     # right kind (re-create cleanly) or the wrong kind (replace).
     try:
@@ -736,7 +758,7 @@ def _setup_turn_channel(profile_name: str) -> tuple[Path, str]:
         # Fall through to JSONL.
         pass
 
-    jsonl_path = ROOM_DIR / f"{profile_name}.jsonl"
+    jsonl_path = ROOM_DIR / f"slot{slot}_{profile_name}.jsonl"
     try:
         jsonl_path.unlink()
     except FileNotFoundError:
@@ -773,33 +795,49 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
         # `run_room` entry point pre-creates them so the proxy is told
         # the path before it boots.
         channels = {
-            profile1: _setup_turn_channel(profile1),
-            profile2: _setup_turn_channel(profile2),
+            1: _setup_turn_channel(1, profile1),
+            2: _setup_turn_channel(2, profile2),
         }
 
     # Conversation log
     messages = prior_messages or []
 
-    # Map profiles to tmux session names
+    # Phase 8: slot-keyed maps. Pane assignment is fixed to the launch
+    # order — slot 1 == profile1's pane, slot 2 == profile2's pane —
+    # and stays that way for the life of the room. Speaker color +
+    # display come from the slot, not the profile name, so a
+    # duplicate-profile run (`room blank blank`) still routes correctly.
     panes = {
-        profile1: f"room-{profile1}",
-        profile2: f"room-{profile2}",
+        1: f"room-{profile1}",
+        2: f"room-{profile2}",
     }
-    colors_map = {
-        profile1: Y,
-        profile2: C,
+    # Default display rule (Phase 8 contract; Phase 8 commit C4 promotes
+    # this to room_control.set_speaker_display + display_for_slot for the
+    # CLI override path). Distinct profiles → bare uppercased name; same
+    # profile in both slots → suffixed `<NAME>#1` / `<NAME>#2`.
+    if profile1 == profile2:
+        display1 = f"{get_display_name(profile1)}#1"
+        display2 = f"{get_display_name(profile2)}#2"
+    else:
+        display1 = get_display_name(profile1)
+        display2 = get_display_name(profile2)
+
+    slot_meta = {
+        1: {"profile": profile1, "color": Y, "display": display1},
+        2: {"profile": profile2, "color": C, "display": display2},
     }
 
-    # Per-profile channel readers. FIFO uses select; JSONL polls.
+    # Per-slot channel readers. FIFO uses select; JSONL polls.
     readers = {}
-    for name in (profile1, profile2):
-        ch_path, ch_kind = channels[name]
+    for slot in (1, 2):
+        ch_path, ch_kind = channels[slot]
         if ch_kind == "fifo":
-            readers[name] = _FifoReader(ch_path)
+            readers[slot] = _FifoReader(ch_path)
         else:
-            readers[name] = _JsonlTailReader(ch_path)
+            readers[slot] = _JsonlTailReader(ch_path)
 
-    # Arbiter — strict turn order + backpressure.
+    # Arbiter — strict turn order + backpressure. Still profile-keyed
+    # internally; the relay-side translation lives in _handle_turn_record.
     arbiter = TurnArbiter(profile1, profile2)
 
     # Give Claude sessions time to start up
@@ -809,10 +847,11 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
         # One-time channel-mode banner so the operator sees which path is
         # live (FIFO is always preferred; JSONL only on platforms where
         # mkfifo failed). Useful for post-mortem on resume + audit logs.
-        for name in (profile1, profile2):
-            _, kind = channels[name]
+        for slot in (1, 2):
+            _, kind = channels[slot]
+            label = f"slot{slot}/{slot_meta[slot]['profile']}"
             room_control.render_transcript_line(
-                "ROOM", f"channel[{name}] = {kind}", DIM,
+                "ROOM", f"channel[{label}] = {kind}", DIM,
             )
 
         room_control.render_transcript_line(
@@ -830,7 +869,7 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 ts=ts,
                 text=topic,
             )
-            send_to_pane(panes[profile1], initial_msg)
+            send_to_pane(panes[1], initial_msg)
             messages.append({
                 "name": USER_NAME,
                 "text": topic,
@@ -850,9 +889,9 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
             for msg in prior_messages[-10:]:  # Last 10 messages
                 context += f"{msg['name']}: {msg['text']}\\n"
             context += "\\nContinue the conversation from where you left off."
-            send_to_pane(panes[profile1], context)
+            send_to_pane(panes[1], context)
             time.sleep(1)
-            send_to_pane(panes[profile2], context)
+            send_to_pane(panes[2], context)
 
         room_control.render_transcript_line(
             "ROOM", "relay active — watching for responses (try /help)", DIM,
@@ -888,11 +927,11 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 "envelope_kind": "interject",
             })
             room_control.render_transcript_line(USER_NAME, text, W)
-            send_to_pane(panes[profile1], envelope)
-            send_to_pane(panes[profile2], envelope)
+            send_to_pane(panes[1], envelope)
+            send_to_pane(panes[2], envelope)
 
         def _inject_to(target: str, text: str) -> None:
-            sess = pane_for_profile(panes, target)
+            sess = pane_for_profile(panes, slot_meta, target)
             if sess is None:
                 room_control.render_transcript_line(
                     "ROOM", f"unknown target: {target}", DIM,
@@ -1006,18 +1045,36 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 )
             return True
 
-        def _handle_turn_record(speaker: str, record: dict) -> None:
-            """Log + render + arbiter-dispatch a completed-turn record."""
+        def _handle_turn_record(reader_slot: int, record: dict) -> None:
+            """Log + render + arbiter-dispatch a completed-turn record.
+
+            Phase 8: speaker identity comes from `record["slot"]` (stamped
+            by the proxy via CCORAL_ROOM_SLOT). The reader's slot is also
+            available — they should agree. If `slot` is missing (legacy
+            proxy or external producer), we fall back to the reader's
+            slot and emit a one-shot WARN line.
+            """
             nonlocal turn_seq
 
             text = (record.get("text") or "").strip()
             if not text:
                 return
 
-            display = get_display_name(speaker)
-            color = colors_map[speaker]
-            other = profile2 if speaker == profile1 else profile1
-            recipient_display = get_display_name(other)
+            rec_slot = record.get("slot")
+            if isinstance(rec_slot, int) and rec_slot in (1, 2):
+                slot = rec_slot
+            else:
+                # Backwards-compat shim: trust the reader's slot. C4
+                # promotes this to a one-shot yellow WARN line via
+                # room_control; for now just fall back silently so the
+                # relay never wedges on a malformed record.
+                slot = reader_slot
+
+            other_slot = 3 - slot
+            speaker = slot_meta[slot]["profile"]
+            display = slot_meta[slot]["display"]
+            color = slot_meta[slot]["color"]
+            recipient_display = slot_meta[other_slot]["display"]
 
             # Log + render the turn into the cockpit transcript. The
             # `from`/`to`/`envelope_kind` fields make Phase 5's export path
@@ -1041,17 +1098,23 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 return
 
             # Hand to the arbiter and execute its decisions in order.
+            # Phase 8: arbiter is still profile-keyed internally, but its
+            # name-keyed `target` / `who` outputs are AMBIGUOUS when both
+            # slots share a profile. Resolve destination by slot instead:
+            # RELAY always goes to the other slot; BACKPRESSURE always
+            # targets the current speaker's slot.
             stop_reason = record.get("stop_reason")
             for decision in arbiter.on_turn_record(speaker, text):
                 kind = decision[0]
                 if kind == TurnArbiter.RELAY:
-                    _, relay_text, target = decision
-                    target_session = panes[target]
+                    _, relay_text, _target_name = decision
+                    target_session = panes[other_slot]
+                    target_display = slot_meta[other_slot]["display"]
                     turn_seq += 1
                     buffer_name = f"ccoral-room-{room_id}-{turn_seq}"
                     envelope = build_relay_envelope(
                         sender=display,
-                        recipient=get_display_name(target),
+                        recipient=target_display,
                         kind="turn",
                         ts=_envelope_iso8601_utc(),
                         stop_reason=stop_reason,
@@ -1061,13 +1124,14 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                         target_session, envelope, buffer_name,
                     )
                 elif kind == TurnArbiter.BACKPRESSURE:
-                    _, sys_text, who, sys_reason = decision
-                    sys_session = panes[who]
+                    _, sys_text, _who_name, sys_reason = decision
+                    sys_session = panes[slot]
+                    sys_display = slot_meta[slot]["display"]
                     turn_seq += 1
                     buffer_name = f"ccoral-room-{room_id}-{turn_seq}"
                     envelope = build_relay_envelope(
                         sender="SYSTEM",
-                        recipient=get_display_name(who),
+                        recipient=sys_display,
                         kind="system",
                         ts=_envelope_iso8601_utc(),
                         reason=sys_reason,
@@ -1081,7 +1145,7 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                         "text": sys_text,
                         "time": datetime.now().isoformat(),
                         "from": "SYSTEM",
-                        "to": who,
+                        "to": sys_display,
                         "reason": sys_reason,
                         "kind": "relay-meta",
                         "envelope_kind": "system",
@@ -1091,15 +1155,15 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
         # ───────────────────────────────────────────────────────────────
 
         # Build the select fd list (FIFO readers only — JSONL is polled
-        # via the timeout tick).
+        # via the timeout tick). Phase 8: readers are slot-keyed.
         select_fds = []
-        for name in (profile1, profile2):
-            r = readers[name]
+        for slot in (1, 2):
+            r = readers[slot]
             fd = r.fileno()
             if fd is not None:
                 select_fds.append(fd)
-        fd_to_name = {readers[n].fileno(): n for n in (profile1, profile2)
-                      if readers[n].fileno() is not None}
+        fd_to_slot = {readers[s].fileno(): s for s in (1, 2)
+                      if readers[s].fileno() is not None}
 
         try:
             while True:
@@ -1151,10 +1215,13 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                     ready = []
 
                 # 3) Drain readable channels (FIFOs from select) +
-                #    poll any JSONL readers regardless.
+                #    poll any JSONL readers regardless. Phase 8: keyed
+                #    by slot. The reader's slot is passed alongside the
+                #    record so the handler can fall back on it when a
+                #    legacy record arrives without an explicit `slot`.
                 turn_records = []
-                for name in (profile1, profile2):
-                    r = readers[name]
+                for slot in (1, 2):
+                    r = readers[slot]
                     fd = r.fileno()
                     if fd is not None and fd not in ready:
                         # FIFO wasn't readable — skip until next tick.
@@ -1164,11 +1231,11 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                             rec = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        turn_records.append((name, rec))
+                        turn_records.append((slot, rec))
 
                 # 4) Process each turn record through the arbiter.
-                for speaker, record in turn_records:
-                    _handle_turn_record(speaker, record)
+                for reader_slot, record in turn_records:
+                    _handle_turn_record(reader_slot, record)
 
                 # 5) After a tick that landed turns, flush any queued
                 #    user events at the turn boundary (Phase 1 contract).
@@ -1309,15 +1376,18 @@ def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None
     print(f"{DIM}Creating room profiles...{NC}")
     room_profiles = create_room_profiles(profile1, profile2)
 
-    # Phase 2: per-profile turn-record channel. Created BEFORE proxy launch
-    # so the FIFO node exists when the proxy first tries to open it for
-    # write. Falls back to JSONL on platforms where `mkfifo` fails.
+    # Phase 2 + Phase 8: per-slot turn-record channel. Created BEFORE
+    # proxy launch so the FIFO node exists when the proxy first tries to
+    # open it for write. Slot-prefixed paths make duplicate-profile
+    # invocations (`room blank blank`) safe — each slot writes to its
+    # own sink instead of trampling a shared `<profile>_response.txt`.
     channels = {
-        profile1: _setup_turn_channel(profile1),
-        profile2: _setup_turn_channel(profile2),
+        1: _setup_turn_channel(1, profile1),
+        2: _setup_turn_channel(2, profile2),
     }
-    for name, (path, kind) in channels.items():
-        print(f"{DIM}Channel[{name}] = {kind} ({path}){NC}")
+    for slot, (path, kind) in channels.items():
+        label = f"slot{slot}/{(profile1, profile2)[slot - 1]}"
+        print(f"{DIM}Channel[{label}] = {kind} ({path}){NC}")
 
     print(f"{DIM}Starting proxies on :{BASE_PORT} and :{BASE_PORT + 1}...{NC}")
     procs = start_proxies(room_profiles, channels=channels)
@@ -1343,13 +1413,13 @@ def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None
 
         # Remove channel nodes (FIFO/JSONL) so a stale node from a crashed
         # run can't confuse the next launch.
-        for name, (path, _kind) in channels.items():
+        for slot, (path, _kind) in channels.items():
             try:
                 Path(path).unlink()
             except FileNotFoundError:
                 pass
             except Exception as e:
-                print(f"{DIM}Channel cleanup ({name}): {e}{NC}")
+                print(f"{DIM}Channel cleanup (slot{slot}): {e}{NC}")
 
         # Clean up temp profiles
         cleanup_room_profiles(profile1, profile2)

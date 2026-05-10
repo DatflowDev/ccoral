@@ -328,78 +328,247 @@ def cmd_edit(name: str):
     os.execvp(editor, [editor, profile["_path"]])
 
 
-def cmd_room(args: list):
-    """Start a multi-profile conversation room."""
-    from room import run_room, export_conversation
+def _parse_room_args(args: list) -> dict:
+    """Hand-rolled arg-walker for `ccoral room` (house style — manual parse).
 
-    # Parse args:
-    #   ccoral room <profile1> <profile2> [topic]
-    #   ccoral room --resume <last|filename>
-    #   ccoral room --export <last|filename> [--output path]
-    resume = None
-    export = None
-    export_output = None
-    profiles = []
-    topic_parts = []
-    # Phase 9 C5: one-release safety net. When set, the room launcher
-    # falls back to the bespoke pre-Phase-9 split-screen cockpit
-    # (room_control_legacy.py) instead of the Textual RoomApp. Phase 12
-    # deletes both the flag and the legacy module if no regressions
-    # surface during the verification window.
-    legacy_cockpit = False
+    Returns a dict with keys:
+      profiles, topic_parts, resume, export, export_output, legacy_cockpit,
+      ls, show_id, plus all RoomConfig-bound flags:
+      user, port, turn_limit, max_chars_per_turn, backpressure_turns,
+      backpressure_timeout, seed1, seed2, moderator, moderator_cadence.
+
+    Each flag uses the same `args[i+1]` peek-and-advance pattern that
+    --resume / --export / --legacy-cockpit already used in this function.
+    Type errors (non-int for --port, non-float for --backpressure-timeout)
+    print a red one-liner and sys.exit(1) — matching the existing
+    convention for malformed flags here.
+    """
+    out = {
+        "profiles": [],
+        "topic_parts": [],
+        "resume": None,
+        "export": None,
+        "export_output": None,
+        "legacy_cockpit": False,
+        "ls": False,
+        "show_id": None,
+        # RoomConfig-bound (None means "use RoomConfig default").
+        "user": None,
+        "port": None,
+        "turn_limit": None,
+        "max_chars_per_turn": None,
+        "backpressure_turns": None,
+        "backpressure_timeout": None,
+        "seed1": None,
+        "seed2": None,
+        "moderator": None,
+        "moderator_cadence": None,
+    }
+
+    def _need_value(flag: str, peek_i: int) -> str:
+        if peek_i >= len(args):
+            print(f"{R}{flag} requires a value{NC}")
+            sys.exit(1)
+        return args[peek_i]
+
+    def _need_int(flag: str, raw: str) -> int:
+        try:
+            return int(raw)
+        except ValueError:
+            print(f"{R}{flag} requires an integer{NC}")
+            sys.exit(1)
+
+    def _need_float(flag: str, raw: str) -> float:
+        try:
+            return float(raw)
+        except ValueError:
+            print(f"{R}{flag} requires a number{NC}")
+            sys.exit(1)
 
     i = 0
     while i < len(args):
-        if args[i] == "--legacy-cockpit":
-            legacy_cockpit = True
+        a = args[i]
+        if a == "--legacy-cockpit":
+            out["legacy_cockpit"] = True
             i += 1
-            continue
-        if args[i] == "--resume":
-            if i + 1 < len(args):
-                resume = args[i + 1]
-                i += 2
+        elif a == "--resume":
+            out["resume"] = _need_value("--resume", i + 1)
+            i += 2
+        elif a == "--export":
+            out["export"] = _need_value("--export", i + 1)
+            i += 2
+        elif a in ("--output", "-o"):
+            out["export_output"] = _need_value("--output", i + 1)
+            i += 2
+        elif a == "--user":
+            out["user"] = _need_value("--user", i + 1)
+            i += 2
+        elif a == "--port":
+            out["port"] = _need_int("--port", _need_value("--port", i + 1))
+            i += 2
+        elif a == "--turn-limit":
+            out["turn_limit"] = _need_int(
+                "--turn-limit", _need_value("--turn-limit", i + 1),
+            )
+            i += 2
+        elif a == "--max-chars-per-turn":
+            out["max_chars_per_turn"] = _need_int(
+                "--max-chars-per-turn",
+                _need_value("--max-chars-per-turn", i + 1),
+            )
+            i += 2
+        elif a == "--backpressure-turns":
+            out["backpressure_turns"] = _need_int(
+                "--backpressure-turns",
+                _need_value("--backpressure-turns", i + 1),
+            )
+            i += 2
+        elif a == "--backpressure-timeout":
+            out["backpressure_timeout"] = _need_float(
+                "--backpressure-timeout",
+                _need_value("--backpressure-timeout", i + 1),
+            )
+            i += 2
+        elif a == "--seed1":
+            out["seed1"] = _need_value("--seed1", i + 1)
+            i += 2
+        elif a == "--seed2":
+            out["seed2"] = _need_value("--seed2", i + 1)
+            i += 2
+        elif a == "--moderator":
+            out["moderator"] = _need_value("--moderator", i + 1)
+            i += 2
+        elif a == "--moderator-cadence":
+            out["moderator_cadence"] = _need_int(
+                "--moderator-cadence",
+                _need_value("--moderator-cadence", i + 1),
+            )
+            i += 2
+        elif a == "ls":
+            # `ccoral room ls` — list rooms. Subverb position only.
+            if not out["profiles"] and not out["topic_parts"]:
+                out["ls"] = True
+                i += 1
                 continue
-            else:
-                print(f"{R}Usage: ccoral room --resume <last|filename>{NC}")
-                sys.exit(1)
-        elif args[i] == "--export":
-            if i + 1 < len(args):
-                export = args[i + 1]
-                i += 2
-                continue
-            else:
-                print(f"{R}Usage: ccoral room --export <last|filename> [--output path]{NC}")
-                sys.exit(1)
-        elif args[i] == "--output" or args[i] == "-o":
-            if i + 1 < len(args):
-                export_output = args[i + 1]
-                i += 2
-                continue
-            else:
-                print(f"{R}--output requires a path{NC}")
-                sys.exit(1)
-        elif len(profiles) < 2:
-            profiles.append(args[i])
+            # Otherwise treat as positional (unlikely; profile named "ls").
+            out["topic_parts"].append(a)
+            i += 1
+        elif a == "show":
+            # `ccoral room show <id>` — page transcript.
+            out["show_id"] = _need_value("show", i + 1)
+            i += 2
+        elif len(out["profiles"]) < 2:
+            out["profiles"].append(a)
+            i += 1
         else:
-            topic_parts.append(args[i])
-        i += 1
+            out["topic_parts"].append(a)
+            i += 1
 
-    if export:
-        path = export_conversation(export, output=export_output)
+    return out
+
+
+def _build_room_config(parsed: dict):
+    """Promote the parsed CLI dict into a RoomConfig.
+
+    Any flag the operator didn't pass falls through as None and the
+    RoomConfig dataclass's own default takes over. Avoids the alternative
+    of duplicating defaults in two places.
+    """
+    from room import RoomConfig
+    kwargs = {}
+    if parsed["user"] is not None:
+        kwargs["user_name"] = parsed["user"]
+    if parsed["port"] is not None:
+        kwargs["base_port"] = parsed["port"]
+    if parsed["turn_limit"] is not None:
+        kwargs["turn_limit"] = parsed["turn_limit"]
+    if parsed["max_chars_per_turn"] is not None:
+        kwargs["max_chars_per_turn"] = parsed["max_chars_per_turn"]
+    if parsed["backpressure_turns"] is not None:
+        kwargs["backpressure_turns"] = parsed["backpressure_turns"]
+    if parsed["backpressure_timeout"] is not None:
+        kwargs["backpressure_timeout_s"] = parsed["backpressure_timeout"]
+    # Seeds: --seed1 explicit beats positional topic; positional topic
+    # promotion happens at the call site so seed2 alone (without seed1)
+    # leaves seed1 free for the legacy positional.
+    if parsed["seed1"] is not None:
+        kwargs["seed1"] = parsed["seed1"]
+    if parsed["seed2"] is not None:
+        kwargs["seed2"] = parsed["seed2"]
+    if parsed["moderator"] is not None:
+        kwargs["moderator"] = parsed["moderator"]
+    if parsed["moderator_cadence"] is not None:
+        kwargs["moderator_cadence"] = parsed["moderator_cadence"]
+    return RoomConfig(**kwargs)
+
+
+def cmd_room(args: list):
+    """Start a multi-profile conversation room.
+
+    Phase 3: arg-walker handles --user / --port / --turn-limit /
+    --max-chars-per-turn / --backpressure-turns / --backpressure-timeout /
+    --seed1 / --seed2 / --moderator / --moderator-cadence in addition to
+    the prior --resume / --export / --legacy-cockpit. Hand-rolled by
+    house style — manual arg-walker, no stdlib parser.
+    """
+    from room import run_room, export_conversation
+
+    parsed = _parse_room_args(args)
+
+    # `ccoral room ls` — Phase 3 C5 will land the implementation; bind
+    # the dispatch here so the flag is reachable from C2 onward.
+    if parsed["ls"]:
+        from room import room_ls
+        room_ls()
+        return
+
+    # `ccoral room show <id>` — same.
+    if parsed["show_id"]:
+        from room import room_show
+        room_show(parsed["show_id"])
+        return
+
+    if parsed["export"]:
+        path = export_conversation(parsed["export"], output=parsed["export_output"])
         print(f"{G}Exported: {path}{NC}")
-    elif resume:
-        run_room(profiles[0] if profiles else "x",
-                 profiles[1] if len(profiles) > 1 else "x",
-                 resume=resume, legacy_cockpit=legacy_cockpit)
-    elif len(profiles) < 2:
+        return
+
+    config = _build_room_config(parsed)
+
+    # Legacy positional topic → seed1 unless --seed1 was explicit.
+    topic = " ".join(parsed["topic_parts"]) if parsed["topic_parts"] else None
+    if topic and config.seed1 is None:
+        # Mutate-then-replace: dataclass instances are intentionally not
+        # immutable here, but we use replace() to keep the assignment
+        # explicit and audit-friendly.
+        from dataclasses import replace
+        config = replace(config, seed1=topic)
+        topic = None  # No longer needed; seed1 carries it.
+
+    if parsed["resume"]:
+        run_room(
+            parsed["profiles"][0] if parsed["profiles"] else "x",
+            parsed["profiles"][1] if len(parsed["profiles"]) > 1 else "x",
+            resume=parsed["resume"],
+            legacy_cockpit=parsed["legacy_cockpit"],
+            config=config,
+        )
+        return
+
+    if len(parsed["profiles"]) < 2:
         print(f"{R}Usage: ccoral room <profile1> <profile2> [topic]{NC}")
         print(f"       ccoral room --resume last")
         print(f"       ccoral room --export <last|filename> [--output path]")
+        print(f"       ccoral room ls")
+        print(f"       ccoral room show <id|last>")
         sys.exit(1)
-    else:
-        topic = " ".join(topic_parts) if topic_parts else None
-        run_room(profiles[0], profiles[1], topic=topic,
-                 legacy_cockpit=legacy_cockpit)
+
+    run_room(
+        parsed["profiles"][0], parsed["profiles"][1],
+        topic=topic,
+        legacy_cockpit=parsed["legacy_cockpit"],
+        config=config,
+    )
 
 
 def cmd_log():

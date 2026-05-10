@@ -30,6 +30,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from profiles import load_profile, list_profiles
+import room_control
 
 # Colors
 Y = "\033[33m"
@@ -318,110 +319,115 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
     }
 
     # Give Claude sessions time to start up
-    print(f"\n{DIM}Waiting for Claude sessions to initialize...{NC}")
-    time.sleep(8)
+    room_control.set_user(USER_NAME)
 
-    # Send initial topic to profile1 only — profile2 hears it through the relay
-    if topic and not prior_messages:
-        initial_msg = f"[{USER_NAME}] {topic}"
-        send_to_pane(panes[profile1], initial_msg)
-        messages.append({
-            "name": USER_NAME,
-            "text": topic,
-            "time": datetime.now().isoformat(),
-        })
-        log_to_control(f"{W}{USER_NAME}:{NC} {topic}")
+    with room_control.split_screen():
+        room_control.render_transcript_line(
+            "ROOM", f"waiting for Claude sessions to initialize...", DIM,
+        )
+        time.sleep(8)
 
-    # If resuming, send context to both panes
-    if prior_messages:
-        context = "Previous conversation context:\\n"
-        for msg in prior_messages[-10:]:  # Last 10 messages
-            context += f"{msg['name']}: {msg['text']}\\n"
-        context += "\\nContinue the conversation from where you left off."
-        send_to_pane(panes[profile1], context)
-        time.sleep(1)
-        send_to_pane(panes[profile2], context)
+        # Send initial topic to profile1 only — profile2 hears it through the relay
+        if topic and not prior_messages:
+            initial_msg = f"[{USER_NAME}] {topic}"
+            send_to_pane(panes[profile1], initial_msg)
+            messages.append({
+                "name": USER_NAME,
+                "text": topic,
+                "time": datetime.now().isoformat(),
+            })
+            room_control.render_transcript_line(USER_NAME, topic, W)
 
-    print(f"{DIM}Relay active. Watching for responses...{NC}")
-    print(f"{DIM}Attach:  tmux attach -t room-{profile1}{NC}")
-    print(f"{DIM}         tmux attach -t room-{profile2}{NC}")
-    print(f"{DIM}Press ctrl-c here to stop the relay and save the conversation.{NC}\n")
+        # If resuming, send context to both panes
+        if prior_messages:
+            context = "Previous conversation context:\\n"
+            for msg in prior_messages[-10:]:  # Last 10 messages
+                context += f"{msg['name']}: {msg['text']}\\n"
+            context += "\\nContinue the conversation from where you left off."
+            send_to_pane(panes[profile1], context)
+            time.sleep(1)
+            send_to_pane(panes[profile2], context)
 
-    # Turn tracking — who we expect to respond next
-    # None = accept from either side
-    expecting = profile1 if topic else None
-    last_speaker = None
+        room_control.render_transcript_line(
+            "ROOM", "relay active — watching for responses", DIM,
+        )
 
-    try:
-        while True:
-            time.sleep(POLL_INTERVAL)
+        # Turn tracking — who we expect to respond next
+        # None = accept from either side
+        expecting = profile1 if topic else None
+        last_speaker = None
 
-            # Check response files for changes
-            check_order = [profile1, profile2]
-            for name in check_order:
-                fpath = files[name]
-                if not fpath.exists():
-                    continue
+        try:
+            while True:
+                time.sleep(POLL_INTERVAL)
 
-                current_mtime = fpath.stat().st_mtime
-                if current_mtime <= mtimes[name]:
-                    continue
+                # Check response files for changes
+                check_order = [profile1, profile2]
+                for name in check_order:
+                    fpath = files[name]
+                    if not fpath.exists():
+                        continue
 
-                # File changed — wait for write to settle
-                time.sleep(SETTLE_TIME)
+                    current_mtime = fpath.stat().st_mtime
+                    if current_mtime <= mtimes[name]:
+                        continue
 
-                # Re-check mtime in case still writing
-                if fpath.stat().st_mtime != current_mtime:
-                    continue  # Still changing, wait for next poll
+                    # File changed — wait for write to settle
+                    time.sleep(SETTLE_TIME)
 
-                mtimes[name] = fpath.stat().st_mtime
+                    # Re-check mtime in case still writing
+                    if fpath.stat().st_mtime != current_mtime:
+                        continue  # Still changing, wait for next poll
 
-                # Read the response
-                try:
-                    response = fpath.read_text().strip()
-                except Exception:
-                    continue
+                    mtimes[name] = fpath.stat().st_mtime
 
-                if not response:
-                    continue
+                    # Read the response
+                    try:
+                        response = fpath.read_text().strip()
+                    except Exception:
+                        continue
 
-                display = get_display_name(name)
-                color = colors_map[name]
+                    if not response:
+                        continue
 
-                # Log it
-                messages.append({
-                    "name": display,
-                    "text": response,
-                    "time": datetime.now().isoformat(),
-                })
+                    display = get_display_name(name)
+                    color = colors_map[name]
 
-                # Print to control pane
-                log_to_control(f"{color}{display}:{NC} {response[:200]}{'...' if len(response) > 200 else ''}")
+                    # Log it
+                    messages.append({
+                        "name": display,
+                        "text": response,
+                        "time": datetime.now().isoformat(),
+                    })
 
-                # Relay to the OTHER session
-                other = profile2 if name == profile1 else profile1
-                other_session = panes[other]
+                    # Render to the cockpit transcript — full text, soft-wrapped.
+                    room_control.render_transcript_line(display, response, color)
 
-                # For multi-line responses, write to file and send read instruction
-                # This preserves paragraph structure instead of flattening
-                if "\n" in response and len(response) > 200:
-                    relay_file = ROOM_DIR / f"from_{name}.txt"
-                    relay_file.write_text(f"[{display}] {response}")
-                    send_to_pane(other_session,
-                                 f"Read /tmp/ccoral-room/from_{name}.txt")
-                else:
-                    clean = response.replace("\n", " ").replace("\r", "")
-                    relay_msg = f"[{display}] {clean}"
-                    send_to_pane(other_session, relay_msg)
+                    # Relay to the OTHER session
+                    other = profile2 if name == profile1 else profile1
+                    other_session = panes[other]
 
-                # Clear the captured response file
-                try:
-                    fpath.unlink()
-                except Exception:
-                    pass
+                    # For multi-line responses, write to file and send read instruction
+                    # This preserves paragraph structure instead of flattening.
+                    # (Phase 2 replaces this leaky relay with tmux paste-buffer.)
+                    if "\n" in response and len(response) > 200:
+                        relay_file = ROOM_DIR / f"from_{name}.txt"
+                        relay_file.write_text(f"[{display}] {response}")
+                        send_to_pane(other_session,
+                                     f"Read /tmp/ccoral-room/from_{name}.txt")
+                    else:
+                        clean = response.replace("\n", " ").replace("\r", "")
+                        relay_msg = f"[{display}] {clean}"
+                        send_to_pane(other_session, relay_msg)
 
-    except KeyboardInterrupt:
-        pass
+                    # Clear the captured response file
+                    try:
+                        fpath.unlink()
+                    except Exception:
+                        pass
+
+        except KeyboardInterrupt:
+            pass
 
     return messages
 

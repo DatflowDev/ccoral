@@ -1542,12 +1542,17 @@ class ControlFifo:
     def stop(self, *, timeout: float = 1.0) -> None:
         """Signal the consumer thread, unlink the sink."""
         self._stop.set()
-        # The FIFO read blocks; nudge it by opening a write end so the
-        # reader returns and notices _stop. Same trick the proxy uses
-        # to unblock its select on shutdown.
+        # The FIFO consumer is in a select loop with a 250ms tick, so
+        # _stop will be observed within one tick even without nudging.
+        # We poke a no-op byte anyway so shutdown is faster — empty line
+        # is dropped as malformed-JSON by _dispatch_line.
         if self.kind == "fifo" and self.path.exists():
             try:
                 fd = os.open(str(self.path), os.O_WRONLY | os.O_NONBLOCK)
+                try:
+                    os.write(fd, b"\n")
+                except OSError:
+                    pass
                 os.close(fd)
             except OSError:
                 pass
@@ -1568,26 +1573,45 @@ class ControlFifo:
             self._run_jsonl()
 
     def _run_fifo(self) -> None:
-        """Block on FIFO reads in a tight loop. Each open returns when
-        a writer connects + writes; on writer close, read returns "" so
-        we re-open and wait for the next sidecar message.
+        """Read from the FIFO in a tight loop. We open with O_RDWR so
+        the FD stays alive across writer-close cycles — otherwise back-
+        to-back producer writes race the consumer's re-open and the
+        second producer hits ENXIO ("no reader") on its O_NONBLOCK open.
+
+        The O_RDWR-on-FIFO trick is Linux-specific but well-established;
+        on platforms where it misbehaves we'd already have fallen back
+        to the JSONL path via the mkfifo failure branch in start().
         """
         buf = b""
-        while not self._stop.is_set():
+        try:
+            fd = os.open(str(self.path), os.O_RDWR)
+        except OSError:
+            return
+        try:
+            while not self._stop.is_set():
+                # Block in a select with a short timeout so we can poll
+                # _stop without spinning. The unblocker in stop() also
+                # writes a byte to wake us, but the timeout is the
+                # belt-and-braces in case that race is lost.
+                try:
+                    ready, _, _ = select.select([fd], [], [], 0.25)
+                except (InterruptedError, OSError):
+                    continue
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    return
+                if not chunk:
+                    continue
+                buf += chunk
+                buf = self._drain_buffer(buf)
+        finally:
             try:
-                # Blocking open + read. The unblocker in stop() opens
-                # the write end so this loop ticks past _stop on shutdown.
-                with open(self.path, "rb", buffering=0) as f:
-                    while not self._stop.is_set():
-                        chunk = f.read(4096)
-                        if not chunk:
-                            # Writer closed; re-open to wait for the next.
-                            break
-                        buf += chunk
-                        buf = self._drain_buffer(buf)
-            except (OSError, ValueError):
-                # FIFO unlinked (stop()) or transient error — exit.
-                return
+                os.close(fd)
+            except OSError:
+                pass
 
     def _run_jsonl(self) -> None:
         """Poll the JSONL fallback with a byte cursor. 100ms tick."""

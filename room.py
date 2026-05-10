@@ -833,16 +833,22 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
         1: f"room-{profile1}",
         2: f"room-{profile2}",
     }
-    # Default display rule (Phase 8 contract; Phase 8 commit C4 promotes
-    # this to room_control.set_speaker_display + display_for_slot for the
-    # CLI override path). Distinct profiles → bare uppercased name; same
-    # profile in both slots → suffixed `<NAME>#1` / `<NAME>#2`.
+    # Phase 8 default display rule. Distinct profiles → bare uppercased
+    # name; same profile in both slots → suffixed `<NAME>#1` / `<NAME>#2`.
+    # Phase 3 will plumb --user-1 / --user-2 overrides through to here;
+    # for now the launcher just resolves slot_meta directly.
     if profile1 == profile2:
         display1 = f"{get_display_name(profile1)}#1"
         display2 = f"{get_display_name(profile2)}#2"
     else:
         display1 = get_display_name(profile1)
         display2 = get_display_name(profile2)
+
+    # Publish the resolved displays so cockpit-side code (status line,
+    # /help footer, future Phase 9 Textual chrome) can read them
+    # without re-deriving from profile names.
+    room_control.set_speaker_display(1, display1)
+    room_control.set_speaker_display(2, display2)
 
     slot_meta = {
         1: {"profile": profile1, "color": Y, "display": display1},
@@ -1083,10 +1089,12 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 return
 
             slot, _legacy = resolve_record_slot(record, reader_slot)
-            # C4 wires `_legacy` to a one-shot yellow WARN line via
-            # room_control. The fallback path is never an mtime/sink-
-            # ordering inference — it's explicitly the FIFO/JSONL
-            # reader that delivered the bytes (see resolve_record_slot).
+            if _legacy:
+                # One yellow WARN per session per (slot, profile) — the
+                # fallback path uses the FIFO reader's slot, never any
+                # mtime / sink-ordering inference. Phase 12 verifies
+                # this branch is unreachable against the in-tree server.
+                room_control.warn_legacy_record(slot, record.get("profile"))
 
             other_slot = 3 - slot
             speaker = slot_meta[slot]["profile"]

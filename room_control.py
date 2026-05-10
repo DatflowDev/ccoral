@@ -79,6 +79,22 @@ SHOW_CURSOR = "\033[?25h"
 
 _user_name = "CASSIUS"
 
+# Phase 8: per-slot speaker display overrides. The room launcher seeds
+# these from --user-1 / --user-2 (Phase 3 wires the flags); the relay
+# reads them for transcript prefixes when a turn lands. None means
+# "use the slot's profile-derived default" (BLANK / BLANK#1 / etc.,
+# computed by the caller and passed in via set_speaker_display).
+_speaker_displays: dict = {1: None, 2: None}
+
+# Phase 8: one-shot legacy-record WARN. The relay falls back to the
+# reader's slot when a turn record arrives without a stamped `slot`
+# field. We emit ONE yellow line per session — Phase 12 verifies the
+# shim is unreachable against the in-tree server, so a warning here
+# means an external producer (test fixture, third-party proxy, or a
+# regression). Set kept at module scope so reload-style cockpit
+# re-entry doesn't reset the dedup state mid-session.
+_legacy_record_warned: set = set()
+
 # Lines pending dispatch — the relay loop drains these after a turn lands.
 _event_queue: list = []
 
@@ -114,13 +130,73 @@ _transcript_cursor = 1
 # ---------------------------------------------------------------------------
 
 def set_user(name: str) -> None:
-    """Configure the user prefix (e.g. 'CASSIUS' → '[CASSIUS] ...')."""
+    """Configure the user prefix (e.g. 'CASSIUS' → '[CASSIUS] ...').
+
+    Pre-Phase-8 callers used this to label the host's interjections.
+    Still the right setter for that — Phase 8 didn't change the host
+    prefix; it added per-slot displays for the two AI speakers.
+    """
     global _user_name
     _user_name = name
 
 
 def get_user() -> str:
     return _user_name
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: per-slot speaker display API
+# ---------------------------------------------------------------------------
+
+def set_speaker_display(slot: int, name: str) -> None:
+    """Set the cockpit display label for slot 1 or slot 2.
+
+    The launcher resolves the right name once at startup using these
+    rules (cockpit display defaults are the launcher's job — this
+    setter just stores whatever it's handed):
+
+      - --user-1 LO --user-2 OPS         → "LO" / "OPS"
+      - distinct profiles, no overrides  → "BLANK" / "LEGUIN"
+      - same profile, no overrides       → "BLANK#1" / "BLANK#2"
+
+    Slot 1/2 only — anything else is a bug in the caller.
+    """
+    if slot not in (1, 2):
+        raise ValueError(f"set_speaker_display: slot must be 1 or 2, got {slot!r}")
+    _speaker_displays[slot] = name
+
+
+def display_for_slot(slot: int) -> str | None:
+    """Return the configured display for `slot`, or None if unset.
+
+    The relay sources slot displays from `slot_meta` (which the
+    launcher populates from the same rules above). This getter exists
+    so cockpit code (status line, /help footer) can render the live
+    label without re-deriving from the profile name.
+    """
+    if slot not in (1, 2):
+        return None
+    return _speaker_displays.get(slot)
+
+
+def warn_legacy_record(slot: int, profile: str | None) -> None:
+    """One-shot yellow WARN that a turn record arrived without a
+    stamped `slot` field (Phase 8 contract violation by the producer).
+
+    Dedupes per (slot, profile) tuple so a noisy producer doesn't
+    spam the cockpit. Phase 12's verification week should never see
+    this line in real sessions — it fires only against legacy proxies
+    or hand-crafted test fixtures.
+    """
+    key = (slot, profile)
+    if key in _legacy_record_warned:
+        return
+    _legacy_record_warned.add(key)
+    render_transcript_line(
+        "ROOM",
+        f"WARN: legacy turn record (slot={slot}, profile={profile!r})",
+        Y,
+    )
 
 
 # ---------------------------------------------------------------------------

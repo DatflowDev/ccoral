@@ -731,6 +731,28 @@ class TurnArbiter:
                 self.stalled_until[p] = 0.0
 
 
+def resolve_record_slot(record: dict, reader_slot: int) -> tuple[int, bool]:
+    """Source of truth for "which slot spoke this turn".
+
+    Returns (slot, was_legacy_fallback). The slot field stamped by the
+    proxy (Phase 8) is authoritative — that's what the launcher chose
+    when spawning the proxy and what server.py wrote into the record.
+    A missing or malformed `slot` means we're consuming a record from
+    a producer that predates the Phase 8 envelope (or a hand-crafted
+    test fixture); we fall back to the reader's slot — the FIFO/JSONL
+    that delivered the bytes — and flag the legacy path.
+
+    The intent is to make the absence of the mtime path explicit:
+    the orchestrator NEVER infers speaker from filesystem ordering,
+    sink-path identity, or which channel "changed first". Speaker
+    identity is carried in the record or it's a legacy bug.
+    """
+    rec_slot = record.get("slot")
+    if isinstance(rec_slot, int) and rec_slot in (1, 2):
+        return rec_slot, False
+    return reader_slot, True
+
+
 def _setup_turn_channel(slot: int, profile_name: str) -> tuple[Path, str]:
     """Create the per-slot turn-record channel (FIFO when supported,
     JSONL fallback). Returns (path, channel_kind).
@@ -1060,15 +1082,11 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
             if not text:
                 return
 
-            rec_slot = record.get("slot")
-            if isinstance(rec_slot, int) and rec_slot in (1, 2):
-                slot = rec_slot
-            else:
-                # Backwards-compat shim: trust the reader's slot. C4
-                # promotes this to a one-shot yellow WARN line via
-                # room_control; for now just fall back silently so the
-                # relay never wedges on a malformed record.
-                slot = reader_slot
+            slot, _legacy = resolve_record_slot(record, reader_slot)
+            # C4 wires `_legacy` to a one-shot yellow WARN line via
+            # room_control. The fallback path is never an mtime/sink-
+            # ordering inference — it's explicitly the FIFO/JSONL
+            # reader that delivered the bytes (see resolve_record_slot).
 
             other_slot = 3 - slot
             speaker = slot_meta[slot]["profile"]

@@ -63,6 +63,7 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
+from textual.message import Message
 from textual.widgets import Footer, Input, RichLog
 
 
@@ -337,6 +338,25 @@ def split_screen():
 # RoomApp — the Textual cockpit itself.
 # ---------------------------------------------------------------------------
 
+class EventReady(Message):
+    """A turn record landed on a per-slot sink (FIFO or JSONL).
+
+    Posted by `tail_relay_records` workers running in background threads;
+    the App's `on_event_ready` handler appends to `self.event_queue` so
+    the relay-runner thread can drain at its own cadence (turn boundary).
+
+    Carries `reader_slot` (the channel the bytes came in on) alongside
+    `record` because the Phase 8 fallback at room.py:1091 needs both —
+    the record is authoritative when it carries `slot`, but the reader
+    slot is the safety net for legacy producers.
+    """
+
+    def __init__(self, reader_slot: int, record: dict) -> None:
+        super().__init__()
+        self.reader_slot = reader_slot
+        self.record = record
+
+
 class RoomApp(App):
     """Single-room cockpit. Replaces room_control.split_screen()."""
 
@@ -390,6 +410,17 @@ class RoomApp(App):
         # Sentinel return value passed to App.exit; surfaces as run()'s
         # return value. Mirrors the legacy "exit cleanly" 0 / "stop" semantics.
         self._exit_code: int = 0
+        # Phase 9 C3: turn-aware queue moved off room_control.py's
+        # module scope onto the App. The queue holds turn records that
+        # arrived via background `tail_relay_records` workers; the
+        # relay-runner thread drains it at turn boundaries (same
+        # contract as room_control's _event_queue, but App-scoped so
+        # multiple rooms in one process don't cross-contaminate when
+        # Phase 11 lands the rooms cockpit). Lock-guarded — workers
+        # post via a Message so the App's main loop owns the append,
+        # but the runner reads from a different thread.
+        self.event_queue: list[tuple[int, dict]] = []
+        self._event_queue_lock = threading.Lock()
 
     # ─── lifecycle ─────────────────────────────────────────────────────
 
@@ -543,23 +574,73 @@ class RoomApp(App):
             return
         log.write(markup)
 
-    # ─── relay worker (stub for C2; real impl lands in C3) ──────────────
+    # ─── turn-aware queue + relay tailer (C3) ──────────────────────────
+
+    @on(EventReady)
+    def on_event_ready(self, event: EventReady) -> None:
+        """A tailer worker delivered a turn record. Append to the
+        per-App queue; the relay runner drains at its own cadence
+        (turn boundary, after backpressure-aware processing).
+
+        The append happens on the App's message-loop thread, so we
+        pair the writer (here) with a lock that the runner-thread
+        drainer can take without racing.
+        """
+        with self._event_queue_lock:
+            self.event_queue.append((event.reader_slot, event.record))
+
+    def drain_event_queue(self) -> list[tuple[int, dict]]:
+        """Pop and return all queued turn records. Order preserved.
+
+        Called from the relay runner's worker thread. Lock-guarded
+        against the App-thread `on_event_ready` writer above.
+        """
+        with self._event_queue_lock:
+            out = list(self.event_queue)
+            self.event_queue.clear()
+        return out
 
     @work(thread=True, exclusive=False)
-    def tail_relay_records(self, sink_path: str) -> None:
-        """Tail a per-slot JSONL/FIFO turn-record sink.
+    def tail_relay_records(self, reader_slot: int, reader: Any) -> None:
+        """Tail a per-slot turn-record reader. Posts EventReady per record.
 
-        STUB in C2 — real implementation moves the FIFO/JSONL reader loop
-        from room.py into the App as part of C3. The decorator wires
-        this method as a background thread worker; calling it (e.g.
-        `self.tail_relay_records("/tmp/sink.jsonl")`) returns a Worker
-        handle and the body runs off-thread. Use `self.call_from_thread`
-        from inside to mutate widgets safely.
+        `reader` is room.py's `_FifoReader` or `_JsonlTailReader` (duck-typed
+        — any object with `.read_lines()` returning an iterable of JSON
+        text lines, plus `.close()` and optionally `.fileno()`). Decoupled
+        from the concrete reader classes so room.py keeps owning channel
+        plumbing and this worker stays a thin pump.
+
+        Posts EventReady(reader_slot, record) for each parseable line.
+        Loops forever until the App exits or the reader signals EOF; the
+        @work decorator turns the worker into a daemon-style thread that
+        Textual cancels on shutdown.
 
         See: https://textual.textualize.io/guide/workers/
         """
-        # Intentionally empty in C2. C3 ports the JSONL/FIFO tailer.
-        return None
+        import json
+        import time as _time
+
+        # Tight loop with a tiny sleep so we don't burn a core when the
+        # reader is idle. The legacy room.py loop used select+timeout;
+        # since each slot now has its own worker, we can poll cheaply.
+        while True:
+            try:
+                lines = list(reader.read_lines())
+            except (ValueError, OSError):
+                # Reader closed or torn down — exit cleanly.
+                return
+            for line in lines:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                self.post_message(EventReady(reader_slot, rec))
+            if not lines:
+                # No new bytes this tick — back off briefly. The
+                # constant matches room.py's RELAY_SELECT_TIMEOUT
+                # within an order of magnitude (50ms ≈ 20 polls/sec)
+                # which is plenty for human-paced turn arrivals.
+                _time.sleep(0.05)
 
     def _spawn_relay_worker(self) -> None:
         """Start the room.py-side relay loop on a background thread.

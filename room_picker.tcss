@@ -1,0 +1,60 @@
+/* Phase 10 — Profile picker stylesheet. Companion to room_picker.py.
+ * Two side-by-side OptionList columns, a description label, and a
+ * hidden Input row that slides in when '/' is pressed. Palette mirrors
+ * room_app.tcss so the picker reads as part of the same cockpit family. */
+
+#columns {
+    height: 1fr;
+}
+
+#col1, #col2 {
+    width: 1fr;
+    border: round $primary;
+    margin: 0 1;
+}
+
+#col1:focus, #col2:focus {
+    border: round $accent;
+}
+
+#description {
+    height: 3;
+    border: round $primary;
+    padding: 0 1;
+    color: $text-muted;
+}
+
+#filter {
+    dock: bottom;
+    height: 3;
+    border: round $accent;
+}
+
+#filter.hidden {
+    display: none;
+}
+
+/* Modal dialogs (confirm + topic prompt) — centered card on a dim
+ * backdrop, same shape for both so the picker has visual consistency
+ * with anything Phase 11's cockpit will overlay. */
+
+ConfirmScreen, TopicScreen {
+    align: center middle;
+}
+
+#dialog {
+    width: 60;
+    height: auto;
+    border: round $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+#dialog Label {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#dialog Input {
+    border: round $primary;
+}

@@ -341,9 +341,19 @@ def cmd_room(args: list):
     export_output = None
     profiles = []
     topic_parts = []
+    # Phase 9 C5: one-release safety net. When set, the room launcher
+    # falls back to the bespoke pre-Phase-9 split-screen cockpit
+    # (room_control_legacy.py) instead of the Textual RoomApp. Phase 12
+    # deletes both the flag and the legacy module if no regressions
+    # surface during the verification window.
+    legacy_cockpit = False
 
     i = 0
     while i < len(args):
+        if args[i] == "--legacy-cockpit":
+            legacy_cockpit = True
+            i += 1
+            continue
         if args[i] == "--resume":
             if i + 1 < len(args):
                 resume = args[i + 1]
@@ -378,7 +388,9 @@ def cmd_room(args: list):
         path = export_conversation(export, output=export_output)
         print(f"{G}Exported: {path}{NC}")
     elif resume:
-        run_room(profiles[0] if profiles else "x", profiles[1] if len(profiles) > 1 else "x", resume=resume)
+        run_room(profiles[0] if profiles else "x",
+                 profiles[1] if len(profiles) > 1 else "x",
+                 resume=resume, legacy_cockpit=legacy_cockpit)
     elif len(profiles) < 2:
         print(f"{R}Usage: ccoral room <profile1> <profile2> [topic]{NC}")
         print(f"       ccoral room --resume last")
@@ -386,7 +398,8 @@ def cmd_room(args: list):
         sys.exit(1)
     else:
         topic = " ".join(topic_parts) if topic_parts else None
-        run_room(profiles[0], profiles[1], topic=topic)
+        run_room(profiles[0], profiles[1], topic=topic,
+                 legacy_cockpit=legacy_cockpit)
 
 
 def cmd_log():

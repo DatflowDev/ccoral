@@ -799,7 +799,8 @@ def _setup_turn_channel(slot: int, profile_name: str) -> tuple[Path, str]:
 
 def relay_loop(profile1: str, profile2: str, topic: str = None,
                prior_messages: list = None,
-               channels: dict | None = None):
+               channels: dict | None = None,
+               legacy_cockpit: bool = False):
     """Drive the room: consume turn records from each proxy's channel,
     feed them to a `TurnArbiter`, and execute its decisions (paste-buffer
     relay, system backpressure messages, stalls).
@@ -818,6 +819,15 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
     # Phase 3 replaces this synthetic id with the real `RoomConfig.room_id`.
     room_id = f"{profile1}-{profile2}-{int(time.time())}"
     turn_seq = 0
+
+    # Phase 9 C5: --legacy-cockpit fallback. Rebind `room_control` to the
+    # bespoke pre-Phase-9 module (now room_control_legacy.py) so every
+    # call site below routes to the old split-screen owner instead of
+    # the Textual RoomApp. The closure that follows closes over this
+    # local binding, so the swap is total. One-release safety net only;
+    # Phase 12 deletes the flag and the legacy module.
+    if legacy_cockpit:
+        import room_control_legacy as room_control  # noqa: F811
 
     if channels is None:
         # Late binding for callers that didn't pre-create channels. This
@@ -1299,12 +1309,19 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
     # handles all of it); _relay_runner executes on a background worker
     # thread spawned from on_mount. Blocks until /stop, Ctrl+C, or the
     # closure returns naturally (end-after-turn).
-    app = room_control.RoomApp(
-        slot_meta=slot_meta,
-        sink_paths=channels,
-        relay_runner=_relay_runner,
-    )
-    app.run()
+    #
+    # C5: --legacy-cockpit branches to the bespoke split-screen here.
+    # Same closure runs in both paths — only the terminal owner differs.
+    if legacy_cockpit:
+        with room_control.split_screen():
+            _relay_runner()
+    else:
+        app = room_control.RoomApp(
+            slot_meta=slot_meta,
+            sink_paths=channels,
+            relay_runner=_relay_runner,
+        )
+        app.run()
 
     return messages
 
@@ -1398,8 +1415,17 @@ def export_conversation(resume: str, output: str = None) -> Path:
     return out_path
 
 
-def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None):
-    """Main entry point for the room."""
+def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None,
+             legacy_cockpit: bool = False):
+    """Main entry point for the room.
+
+    legacy_cockpit (Phase 9 C5): when True, fall back to the bespoke
+    room_control_legacy split-screen instead of the Textual RoomApp.
+    One-release safety net behind the `--legacy-cockpit` CLI flag —
+    Phase 12 deletes the flag (and the legacy module) once the new
+    cockpit has run a verification week without regressions. See
+    .plan/room-overhaul.md Phase 9 step 7 (line 245).
+    """
 
     prior_messages = None
 
@@ -1450,6 +1476,7 @@ def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None
     try:
         messages = relay_loop(
             profile1, profile2, topic, prior_messages, channels=channels,
+            legacy_cockpit=legacy_cockpit,
         )
     finally:
         print(f"\n{DIM}Cleaning up...{NC}")

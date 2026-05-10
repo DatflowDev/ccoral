@@ -51,6 +51,7 @@ from refusal import detect_refusal, all_refusals
 from reminders import classify_reminder
 from tool_scrub import scrub_tool_descriptions
 from lanes import detect_lane
+from room_filters import is_filler_turn
 from rewrite_terminal import (
     RewriteTerminalState,
     Upstream2Relay,
@@ -149,10 +150,18 @@ def _iso8601_utc_now() -> str:
 def _should_emit_turn_record(text: str, model: str | None) -> bool:
     """Skip rules for room-mode turn capture.
 
-    Identical to the legacy RESPONSE_FILE filter but factored out so it can
-    be unit-tested in isolation: skip haiku tier, skip pure-JSON titles,
-    skip <20 char fragments. Empty text is also skipped (the legacy code
-    was structured to short-circuit on falsy `captured_text`).
+    Layered filters (cheapest first, most specific last):
+      1. empty / haiku / pure-JSON / <20 chars   — original Phase 2 gates
+      2. is_filler_turn(...)                     — data-driven deny list
+                                                   (see room_filters.py for
+                                                   the empirical patterns)
+
+    The 20-char threshold is intentionally preserved at 20 (not 30): mining
+    the real transcripts showed substantive content like "ratify and continue
+    to wave 2" (29) and "/gsd-execute-phase 2" (20) clusters in the 20-29
+    band, while recurring filler runs 30-50 chars and is caught by pattern
+    instead. Pattern-based denial does the work a length bump would do too
+    coarsely.
     """
     if not text:
         return False
@@ -161,6 +170,10 @@ def _should_emit_turn_record(text: str, model: str | None) -> bool:
     if len(text) < 20:
         return False
     if text.startswith("{") and text.endswith("}"):
+        return False
+    is_filler, category = is_filler_turn(text, model)
+    if is_filler:
+        log.info("Filler turn denied: category=%s text=%r", category, text[:60])
         return False
     return True
 

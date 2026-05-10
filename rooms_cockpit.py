@@ -46,11 +46,15 @@ References (verified against installed textual==8.2.5):
 
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 from typing import Any
 
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.message import Message
 from textual.widgets import (
     Footer,
     Header,
@@ -59,6 +63,31 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
 )
+
+
+# ---------------------------------------------------------------------------
+# Slot-color resolution. Mirrors room_watch.py so a per-room line in the
+# cockpit looks identical to the same line under `ccoral room watch`.
+# ---------------------------------------------------------------------------
+
+_SLOT_CLASS = {1: "speaker-1", 2: "speaker-2"}
+
+
+def _classify(rec: dict, *, user_name: str) -> str:
+    """Return the css class for a record: speaker-1 / speaker-2 / system / host."""
+    slot = rec.get("slot")
+    if isinstance(slot, int) and slot in _SLOT_CLASS:
+        return _SLOT_CLASS[slot]
+    name = (rec.get("name") or "").upper()
+    if name == "SYSTEM" or name == "ROOM":
+        return "system"
+    if name == user_name.upper():
+        return "host"
+    return "system"
+
+
+def _escape_markup(text: str) -> str:
+    return text.replace("[", r"\[")
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +115,29 @@ def discover_room_ids(base: "Path | None" = None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Custom messages — the only thread-safe way to mutate App state from a
+# background @work(thread=True) tailer. The worker posts a Message; the
+# App's main loop dispatches to the @on handler which owns the widget
+# mutation. Same pattern Phase 9 used for EventReady.
+# ---------------------------------------------------------------------------
+
+
+class RoomLine(Message):
+    """A new transcript line landed for ``room_id``.
+
+    Carries the parsed record so the App handler can render with the
+    same slot-color mapping room_watch.py uses, and update the
+    last-active-room tracker that C4's unified-mode input dispatch
+    targets when no `/room` prefix is present.
+    """
+
+    def __init__(self, room_id: str, record: dict) -> None:
+        super().__init__()
+        self.room_id = room_id
+        self.record = record
+
+
+# ---------------------------------------------------------------------------
 # RoomsCockpit — the App itself.
 # ---------------------------------------------------------------------------
 
@@ -110,6 +162,8 @@ class RoomsCockpit(App):
         *,
         room_ids: "list[str] | None" = None,
         base: "Path | None" = None,
+        user_name: str = "CASSIUS",
+        poll_interval: float = 0.25,
         **kwargs: Any,
     ) -> None:
         """Construct the cockpit.
@@ -118,14 +172,37 @@ class RoomsCockpit(App):
         used by ``ccoral room watch <id>`` (single-tab subset, wired in
         C6) and by the C7 fixture-driven tests. When None we discover
         from ``~/.ccoral/rooms/`` (or ``base`` if supplied for tests).
+
+        ``base`` is the per-room state archive root. None resolves to
+        the production default (``~/.ccoral/rooms``); tests pass a
+        tmp_path so transcript writers and the cockpit agree on where
+        the JSONL files live.
+
+        ``user_name`` colors host lines and is forwarded to the slot-
+        classifier; matches room_watch.py's contract.
+
+        ``poll_interval`` controls how often each tailer's loop wakes
+        when its transcript is idle. 250ms matches the watch sidecar.
         """
         super().__init__(**kwargs)
         self._explicit_room_ids = room_ids
         self._discovery_base = base
+        self.user_name = user_name
+        self.poll_interval = poll_interval
         # Resolved at compose() so on_mount can act on the same list.
         self.room_ids: list[str] = []
         # Unified-mode flag (Ctrl+U toggles). Tabs mode is the default.
         self.unified_mode: bool = False
+        # Per-room read cursors for the tailers. Bytes already consumed
+        # from each transcript so a worker restart resumes cleanly.
+        self._cursors: dict[str, int] = {}
+        # Carry partial JSONL lines between reads — same byte-buffer
+        # discipline room_watch.py uses to avoid mid-line tears.
+        self._line_bufs: dict[str, bytes] = {}
+        # The most recently active room — the unified-mode dispatcher
+        # in C4 targets this when the operator types plain text without
+        # a `/room <id>` prefix.
+        self.last_active_room: "str | None" = None
 
     # ─── compose / lifecycle ───────────────────────────────────────────
 
@@ -185,8 +262,12 @@ class RoomsCockpit(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        """Drop a seed line into each tab so the operator sees the
-        cockpit came up cleanly even before any turn lands.
+        """Drop a seed line into each tab and spawn one tailer per room.
+
+        Each tailer runs as a `@work(thread=True, group="tail")` worker
+        so the asyncio event loop stays free for input + redraws. The
+        worker posts `RoomLine` messages back to the App, which the
+        main-thread handler appends to the right RichLog.
 
         The placeholder tab (no rooms discovered) gets a one-liner
         directing the operator to start a room from another terminal.
@@ -207,6 +288,29 @@ class RoomsCockpit(App):
             except Exception:
                 continue
             log.write(f"  [system]watching {room_id}[/system]")
+            # Resolve transcript path through the discovery base so tests
+            # can run against a tmp_path archive.
+            transcript = self._transcript_path_for(room_id)
+            if transcript is None:
+                log.write(
+                    f"  [warn]no state dir for {room_id}; nothing to tail[/warn]"
+                )
+                continue
+            self.tail_room(room_id, str(transcript))
+
+    def _transcript_path_for(self, room_id: str) -> "Path | None":
+        """Resolve the transcript.jsonl for a room id under the active
+        discovery base. Returns None if the room dir doesn't exist; the
+        cockpit treats that as a benign "nothing to tail yet" rather
+        than crashing.
+        """
+        from room import ROOMS_ARCHIVE
+
+        base = self._discovery_base if self._discovery_base is not None else ROOMS_ARCHIVE
+        room_dir = base / room_id
+        if not room_dir.is_dir():
+            return None
+        return room_dir / "transcript.jsonl"
 
     # ─── tab navigation actions ────────────────────────────────────────
 
@@ -235,6 +339,118 @@ class RoomsCockpit(App):
             current_idx = 0
         next_idx = (current_idx + direction) % len(self.room_ids)
         tabs.active = _pane_id(self.room_ids[next_idx])
+
+    # ─── tailer worker (one per room) ──────────────────────────────────
+
+    @work(thread=True, exclusive=False, group="tail")
+    def tail_room(self, room_id: str, jsonl_path: str) -> None:
+        """Follow one room's transcript.jsonl; post a RoomLine per record.
+
+        Polls the file size, reads new bytes since the last cursor, and
+        splits on newlines (carrying any partial trailing line into the
+        next read so a torn write doesn't get dropped as malformed
+        JSON). Each parsed record is delivered to the App's main thread
+        via ``post_message`` — the @on(RoomLine) handler then writes to
+        the right RichLog.
+
+        Per the Phase 11 hard rules: this worker performs no subprocess
+        spawn, no relay-loop call, no run_room call. It strictly reads
+        a JSONL file and emits messages.
+        """
+        path = Path(jsonl_path)
+        cursor = self._cursors.setdefault(room_id, 0)
+        buf = self._line_bufs.setdefault(room_id, b"")
+        while True:
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                # Transcript not yet created — wait and retry. A freshly
+                # started room writes its first record only after the
+                # first turn lands; the watch sidecar handles this the
+                # same way (see room_watch.py:158).
+                time.sleep(self.poll_interval)
+                continue
+            if size < cursor:
+                # File truncated / rotated (rename / delete). Reset and
+                # restart the read from the head — the same forgiving
+                # behavior room_watch.py adopts.
+                cursor = 0
+                buf = b""
+            if size > cursor:
+                try:
+                    with open(path, "rb") as f:
+                        f.seek(cursor)
+                        chunk = f.read(size - cursor)
+                except OSError:
+                    time.sleep(self.poll_interval)
+                    continue
+                cursor = size
+                buf += chunk
+                lines = buf.split(b"\n")
+                buf = lines[-1]
+                for raw in lines[:-1]:
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    # post_message is the documented thread-safe path
+                    # for delivering messages from a worker thread.
+                    self.post_message(RoomLine(room_id, rec))
+                # Persist the cursor + carry-buffer for any external
+                # introspection (and so a worker restart resumes
+                # cleanly without re-rendering already-seen turns).
+                self._cursors[room_id] = cursor
+                self._line_bufs[room_id] = buf
+            else:
+                time.sleep(self.poll_interval)
+
+    # ─── message handlers ──────────────────────────────────────────────
+
+    def on_room_line(self, message: RoomLine) -> None:
+        """A tailer delivered a parsed transcript record. Render it to
+        the per-room RichLog (always) and to the unified-log (always,
+        prefixed with the room id) so toggling between modes never
+        loses history.
+
+        Updates ``self.last_active_room`` so unified-mode plain-text
+        input (C4) targets the most-recently-active room when no
+        explicit `/room <id>` prefix is present.
+        """
+        room_id = message.room_id
+        rec = message.record
+        self.last_active_room = room_id
+        css = _classify(rec, user_name=self.user_name)
+        name = rec.get("name") or "?"
+        text = rec.get("text") or ""
+        # Per-room log line — same shape as room_watch.py's renderer.
+        per_room = (
+            f"  [{css}]{_escape_markup(name)}:[/{css}] "
+            f"{_escape_markup(text)}"
+        )
+        try:
+            log = self.query_one(f"#{_log_id(room_id)}", RichLog)
+        except Exception:
+            log = None
+        if log is not None:
+            log.write(per_room)
+        # Unified line — prefixed with the room id so it remains
+        # disambiguable when N rooms interleave.
+        unified = (
+            f"  [system]\\[{_escape_markup(room_id)}][/system] "
+            f"[{css}]{_escape_markup(name)}:[/{css}] "
+            f"{_escape_markup(text)}"
+        )
+        try:
+            unified_log = self.query_one("#unified-log", RichLog)
+        except Exception:
+            unified_log = None
+        if unified_log is not None:
+            unified_log.write(unified)
+
+    # ─── mode + badge actions ──────────────────────────────────────────
 
     def action_toggle_unified(self) -> None:
         """C4 lands the real toggle. The binding is wired here so the

@@ -62,6 +62,27 @@ strict: false         # default: false
 # profile that materially changes worker behavior; subagents called by
 # such a worker should see the same behavioral framing.
 apply_to_subagents: false  # default: false
+
+# Optional: refusal detection on the response stream.
+#   passthrough       (default) — no detection, no logging. Same as today.
+#   log               — scan captured response text for refusal idioms;
+#                       log a warning + append a structured record to
+#                       ~/.ccoral/logs/refusals.jsonl. Non-invasive — the
+#                       response still streams to the user unchanged.
+#                       Use this to characterize refusal rate before
+#                       deciding on stronger interception.
+#   rewrite_terminal  (Phase 3b, NOT YET IMPLEMENTED) — strip the refusal
+#                       preamble before it reaches the client; let the
+#                       remainder of the response stream through.
+#   reset_turn        (Phase 3c, NOT YET IMPLEMENTED) — abort the upstream
+#                       request mid-refusal and re-issue with stronger
+#                       anti-refusal framing prepended; stream the new
+#                       response.
+#
+# Detection patterns live in refusal.py (REFUSAL_PATTERNS). Each pattern
+# has a label used in logs; add new patterns there when a refusal flies
+# past undetected, remove patterns that produce false positives.
+refusal_policy: passthrough  # default: passthrough
 ```
 
 ## Section Names

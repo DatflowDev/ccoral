@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from parser import parse_system_prompt, apply_profile, rebuild_system_prompt, dump_tree
 from profiles import load_active_profile, get_active_profile, load_profile
+from refusal import detect_refusal, all_refusals
 
 # Config
 ANTHROPIC_API = "https://api.anthropic.com"
@@ -575,8 +576,15 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
 
             await response.prepare(request)
 
-            # Accumulate text blocks if we're capturing for room mode
-            captured_text = [] if RESPONSE_FILE else None
+            # Accumulate text blocks if we're capturing for room mode OR if
+            # the active profile has refusal detection enabled (any non-
+            # passthrough refusal_policy). Text capture is the prerequisite
+            # for both — Phase 3a uses it for log-mode refusal observability.
+            _refusal_policy = (
+                (profile.get("refusal_policy", "passthrough") if profile else "passthrough")
+            )
+            _need_text_for_refusal = _refusal_policy != "passthrough"
+            captured_text = [] if (RESPONSE_FILE or _need_text_for_refusal) else None
 
             # ONE-SHOT SSE DUMP: if a marker file exists, dump full SSE of next
             # response to it, then delete the marker. Used for debugging stream
@@ -652,7 +660,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
 
             # Write captured response to file for room relay
             # Skip short responses (titles, summaries) and non-main-model calls
-            if captured_text is not None and captured_text:
+            if RESPONSE_FILE and captured_text is not None and captured_text:
                 full_text = "".join(captured_text).strip()
                 model = body.get("model", "")
                 is_haiku = model_tier(model) == "haiku"
@@ -667,6 +675,56 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                         log.error(f"Room capture failed: {e}")
                 elif full_text:
                     log.debug(f"Room capture skipped: haiku={is_haiku} json={is_json} short={is_too_short} len={len(full_text)}")
+
+            # Phase 3a: refusal observability. When the active profile has a
+            # non-passthrough refusal_policy, scan the captured response text
+            # for refusal idioms and log matches. Phase 3a only implements
+            # `log` mode; `rewrite_terminal` and `reset_turn` interception
+            # modes are deferred to a follow-up that reorganizes the SSE loop
+            # to support pre-emit buffering.
+            if (
+                _refusal_policy in ("log", "rewrite_terminal", "reset_turn")
+                and captured_text is not None
+                and captured_text
+            ):
+                full_text = "".join(captured_text).strip()
+                # Skip short non-text responses (status pings, JSON tool
+                # results echoed back, etc.). Refusals are usually a few
+                # sentences at minimum.
+                if len(full_text) >= 20 and not (
+                    full_text.startswith("{") and full_text.endswith("}")
+                ):
+                    matches = all_refusals(full_text)
+                    if matches:
+                        labels = ",".join(m[0] for m in matches)
+                        first = matches[0]
+                        log.warning(
+                            f"REFUSAL detected (policy={_refusal_policy}, "
+                            f"profile={profile_name}, model={body.get('model','?')}, "
+                            f"matches=[{labels}]): {first[2]!r} at offset {first[1]}"
+                        )
+                        # Write structured event for offline analysis.
+                        try:
+                            ref_log = Path.home() / ".ccoral" / "logs" / "refusals.jsonl"
+                            ref_log.parent.mkdir(parents=True, exist_ok=True)
+                            with open(ref_log, "a") as rf:
+                                rf.write(json.dumps({
+                                    "timestamp": datetime.now().isoformat(),
+                                    "profile": profile_name,
+                                    "model": body.get("model"),
+                                    "policy": _refusal_policy,
+                                    "matches": [
+                                        {"label": m[0], "offset": m[1], "text": m[2]}
+                                        for m in matches
+                                    ],
+                                    "preview": full_text[:300],
+                                }) + "\n")
+                        except Exception as e:
+                            log.error(f"Refusal log failed: {e}")
+                        # NOTE: Phase 3a is detection-only. rewrite_terminal
+                        # and reset_turn would intervene before the response
+                        # was forwarded; they need an SSE-buffering refactor
+                        # which is the subject of the next commit.
 
             t_last_chunk = _time.perf_counter()
 

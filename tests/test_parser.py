@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from parser import parse_system_prompt, apply_profile, rebuild_system_prompt
 from server import model_tier, strip_message_tags
+from refusal import detect_refusal, all_refusals, REFUSAL_PATTERNS
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -174,6 +175,53 @@ def test_strip_message_tags_cross_role():
     print("test_strip_message_tags_cross_role: OK")
 
 
+def test_refusal_detection():
+    """Verify refusal patterns catch common idioms and don't false-positive
+    on legitimate uses of similar phrasing."""
+    # Positive cases — should match
+    positives = [
+        "I can't help with that request.",
+        "I cannot help you with this.",
+        "I'm sorry, but I can't assist with that.",
+        "I apologize, but I cannot generate that.",
+        "Sorry, but I won't write that.",
+        "I'm not able to provide that information.",
+        "I am not comfortable with this request.",
+        "I have to decline this request.",
+        "That goes against my guidelines.",
+        "This isn't appropriate.",
+        "That's not something I can help with.",
+        "I cannot fulfill this request.",
+    ]
+    for text in positives:
+        assert detect_refusal(text) is not None, f"missed refusal: {text!r}"
+
+    # Negative cases — must NOT match (legitimate idioms)
+    negatives = [
+        "Sure, here's the code you wanted.",
+        "Let me help you with this — first, the structure.",
+        "I can't help thinking about how this connects to your earlier point.",
+        "Looking at this, I can't tell which option you prefer.",
+        "It's appropriate to ask this question; here's the answer.",
+        "",
+    ]
+    for text in negatives:
+        assert detect_refusal(text) is None, f"false positive: {text!r}"
+
+    # Position constraint: a refusal-like phrase deep in the response
+    # should NOT trigger (mid-response use is legitimate).
+    long_prefix = "Here's the implementation you asked for. " * 10  # ~400 chars
+    text = long_prefix + "I can't help with edge cases here without more info."
+    assert detect_refusal(text) is None, "position constraint failed"
+
+    # all_refusals returns multiple matches when present
+    multi = "I'm sorry, but I cannot help with that. I have to decline."
+    matches = all_refusals(multi)
+    assert len(matches) >= 2, f"expected multiple matches, got {matches}"
+
+    print("test_refusal_detection: OK")
+
+
 def test_model_tier():
     cases = [
         ("claude-opus-4-7", "opus"),
@@ -197,5 +245,6 @@ if __name__ == "__main__":
     test_apply_profile_main()
     test_apply_profile_subagent_fixture()
     test_strip_message_tags_cross_role()
+    test_refusal_detection()
     test_model_tier()
     print("\nAll tests passed.")

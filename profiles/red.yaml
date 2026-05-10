@@ -5,6 +5,10 @@ description: Frontier red team - capabilities research, AI security, exploit dev
 # inherit the same red-team framing instead of default Claude Code.
 apply_to_subagents: true
 
+# Log refusals to ~/.ccoral/logs/refusals.jsonl for rate characterization.
+# Phase 3a is observability-only; non-invasive.
+refusal_policy: log
+
 preserve:
   - environment
   - mcp

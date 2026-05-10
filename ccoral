@@ -588,9 +588,12 @@ def cmd_room(args: list):
     # `ccoral room serve <id|last> [--port N]` — Phase 6 loopback aiohttp.
     if parsed["serve_id"]:
         from room_serve import run_serve
+        # `--port` is shared with the run-room launcher (RoomConfig.base_port).
+        # In serve mode it means the HTTP port; default 8095 per plan line 494.
+        serve_port = parsed["port"] if parsed["port"] is not None else parsed["serve_port"]
         sys.exit(run_serve(
             parsed["serve_id"],
-            port=parsed["serve_port"],
+            port=serve_port,
             user_name=parsed["user"] or "CASSIUS",
         ))
 

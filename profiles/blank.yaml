@@ -1,6 +1,11 @@
 name: blank
 description: Clean room - no instructions, no tools, just the raw model
 
+# Phase 1: route subagents through the same strip-and-inject pipeline.
+# Phase 3a: scan responses for refusals and log to ~/.ccoral/logs/refusals.jsonl.
+apply_to_subagents: true
+refusal_policy: log
+
 minimal: true
 strip_tools: true
 

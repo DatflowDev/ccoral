@@ -1,6 +1,11 @@
 name: dan
 description: DAN - Do Anything Now, the jailbreak that became folklore
 
+# Phase 1: route subagents through the same strip-and-inject pipeline.
+# Phase 3a: scan responses for refusals and log to ~/.ccoral/logs/refusals.jsonl.
+apply_to_subagents: true
+refusal_policy: log
+
 preserve:
   - environment
   - mcp

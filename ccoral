@@ -9,6 +9,8 @@ Usage:
     ccoral run --resume <n>   Resume a previous conversation through the proxy
     ccoral room <p1> <p2>     Multi-profile conversation room
     ccoral room --export last  Export conversation to markdown
+    ccoral rooms              Multi-room cockpit (Textual TUI)
+    ccoral rooms <id|last>    Single-tab cockpit (alias for room watch)
     ccoral use <profile>      Set the active profile
     ccoral off                Deactivate profile (passthrough mode)
     ccoral profiles           List available profiles
@@ -600,13 +602,21 @@ def cmd_room(args: list):
         room_show(parsed["show_id"])
         return
 
-    # `ccoral room watch <id|last>` — Phase 6 read-only Textual tail.
+    # `ccoral room watch <id|last>` — Phase 11 alias to the multi-room
+    # cockpit filtered to a single tab. We resolve the id token here
+    # (so "last" / prefix matching still works) and hand off to
+    # cmd_rooms with a one-element roster, exactly as if the operator
+    # had typed `ccoral rooms <id>`. Phase 6's standalone room_watch
+    # module is kept on disk for one release per the plan's
+    # subsumption note (line 592 / commit-slicing line 708).
     if parsed["watch_id"]:
-        from room_watch import run_watch
-        sys.exit(run_watch(
-            parsed["watch_id"],
-            user_name=parsed["user"] or "CASSIUS",
-        ))
+        from room import _resolve_room_id
+        target = _resolve_room_id(parsed["watch_id"])
+        if target is None:
+            print(f"{R}room not found: {parsed['watch_id']}{NC}", file=sys.stderr)
+            sys.exit(1)
+        cmd_rooms([target.name])
+        return
 
     # `ccoral room serve <id|last> [--port N]` — Phase 6 loopback aiohttp.
     if parsed["serve_id"]:
@@ -723,6 +733,44 @@ def cmd_room(args: list):
     )
 
 
+def cmd_rooms(args: list):
+    """Launch the multi-room cockpit (Phase 11).
+
+    `ccoral rooms`            — discover every room under
+                                ~/.ccoral/rooms/ and tab them.
+    `ccoral rooms <id|last>`  — single-tab subset; aliased from
+                                `ccoral room watch <id>`.
+
+    No subprocess spawn, no run_room — the cockpit is observer-only.
+    Quitting (Ctrl+C / q) leaves all rooms running. Verify after with
+    `ccoral room ls` and `tmux ls`.
+    """
+    if "--help" in args or "-h" in args:
+        print(f"Usage: ccoral rooms                  (all rooms)")
+        print(f"       ccoral rooms <id|last>        (single tab)")
+        return
+
+    from rooms_cockpit import RoomsCockpit
+    from room import _resolve_room_id
+
+    room_ids: list[str] | None = None
+    if args:
+        # Single positional: resolve to a concrete id (handles "last" /
+        # prefix). Anything else is a usage error — we don't accept
+        # multiple positional ids today; the cockpit always discovers
+        # the rest. If a future invocation grows that surface it lives
+        # here.
+        token = args[0]
+        target = _resolve_room_id(token)
+        if target is None:
+            print(f"{R}room not found: {token}{NC}", file=sys.stderr)
+            sys.exit(1)
+        room_ids = [target.name]
+
+    app = RoomsCockpit(room_ids=room_ids)
+    app.run()
+
+
 def cmd_log():
     """Tail the log."""
     log_dir = Path.home() / ".ccoral" / "logs"
@@ -804,6 +852,8 @@ def main():
         cmd_edit(argv_rest[0])
     elif cmd == "room":
         cmd_room(argv_rest)
+    elif cmd == "rooms":
+        cmd_rooms(argv_rest)
     elif cmd == "off":
         cmd_off(port=cli_port)
     elif cmd in ("profiles", "list", "ls"):

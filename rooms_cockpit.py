@@ -9,8 +9,8 @@ state-dir contract), spawns one background tailer per room that follows
 ``transcript.jsonl``, and routes operator input back through the per-room
 control FIFO contract from Phase 6.
 
-Read-only on lifecycle. The cockpit does not call ``run_room``, does not
-spawn ``relay_loop``, does not start tmux sessions, does not write to
+Read-only on lifecycle. The cockpit never starts rooms, never invokes
+the relay loop, never starts tmux sessions, and never writes to
 ``transcript.jsonl``. The only outbound traffic is JSON lines on the
 per-room control sink, written via ``room.write_control_event`` — the
 same producer-side helper Phase 6's watch / serve sidecars use. Quitting
@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from textual import on, work
+from textual.worker import get_current_worker
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.message import Message
@@ -268,6 +269,11 @@ class RoomsCockpit(App):
         # plan line 588. Tests override to 0 so the assertion path
         # doesn't have to sleep.
         self.stopped_grace_s: float = 30.0
+        # Set on App unmount so background tail workers exit their
+        # poll loops promptly. Without this, ``app.exit()`` blocks
+        # for up to one ``poll_interval`` per tailer waiting on the
+        # ``time.sleep`` inside the read loop.
+        self._shutting_down: bool = False
 
     # ─── compose / lifecycle ───────────────────────────────────────────
 
@@ -363,6 +369,17 @@ class RoomsCockpit(App):
                 continue
             self.tail_room(room_id, str(transcript))
 
+    def on_unmount(self) -> None:
+        """Signal background tail workers to exit. ``app.exit()`` waits
+        for thread workers to return before completing teardown; the
+        flag lets each ``_tail_loop`` iteration return cleanly within
+        one poll interval.
+        """
+        self._shutting_down = True
+
+    def _is_shutting_down(self) -> bool:
+        return self._shutting_down
+
     def _transcript_path_for(self, room_id: str) -> "Path | None":
         """Resolve the transcript.jsonl for a room id under the active
         discovery base. Returns None if the room dir doesn't exist; the
@@ -450,7 +467,12 @@ class RoomsCockpit(App):
         # plan's verification target ("(stopped) badge within 2s").
         liveness_every_n_ticks = 8
         idle_ticks = 0
-        while True:
+        # Cooperative shutdown — Textual sets is_cancelled on the
+        # worker when the App is shutting down. Without this, the
+        # ``time.sleep`` inside the loop blocks teardown for up to one
+        # poll_interval per tailer, which adds up across N rooms.
+        worker = get_current_worker()
+        while not worker.is_cancelled and not self._is_shutting_down():
             try:
                 size = path.stat().st_size
             except FileNotFoundError:

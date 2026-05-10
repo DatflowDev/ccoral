@@ -33,7 +33,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from profiles import load_profile, list_profiles
-import room_control
+# Phase 9 C4: cockpit owner is now the Textual app (room_app.RoomApp).
+# room_app exposes the same module-level surface as the legacy
+# room_control (set_user / set_speaker_display / render_transcript_line /
+# render_help / read_command / enqueue_user_event / drain_user_events /
+# warn_legacy_record), so call sites below stay unchanged. The legacy
+# bespoke-cockpit module is renamed to room_control_legacy in C5 and
+# kept as a one-release safety net behind --legacy-cockpit. See
+# .plan/room-overhaul.md Phase 9 step 6 (line 237).
+import room_app as room_control
 
 # Colors
 Y = "\033[33m"
@@ -871,7 +879,13 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
     # Give Claude sessions time to start up
     room_control.set_user(USER_NAME)
 
-    with room_control.split_screen():
+    # Phase 9 C4: relay runs in a Textual @work(thread=True) worker
+    # spawned by RoomApp. The closure below is the runner — same body
+    # as the legacy `with split_screen():` block, just lifted into a
+    # function so the App can hand it to its worker thread. App.run()
+    # blocks the main thread until /stop or Ctrl+C; the closure exits
+    # naturally once the relay loop breaks.
+    def _relay_runner(app=None):
         # One-time channel-mode banner so the operator sees which path is
         # live (FIFO is always preferred; JSONL only on platforms where
         # mkfifo failed). Useful for post-mortem on resume + audit logs.
@@ -1279,6 +1293,18 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
         finally:
             for r in readers.values():
                 r.close()
+
+    # Phase 9 C4: hand the closure to RoomApp and run the cockpit. The
+    # App owns the terminal (alt screen, input, scroll region — Textual
+    # handles all of it); _relay_runner executes on a background worker
+    # thread spawned from on_mount. Blocks until /stop, Ctrl+C, or the
+    # closure returns naturally (end-after-turn).
+    app = room_control.RoomApp(
+        slot_meta=slot_meta,
+        sink_paths=channels,
+        relay_runner=_relay_runner,
+    )
+    app.run()
 
     return messages
 

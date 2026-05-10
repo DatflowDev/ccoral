@@ -816,7 +816,7 @@ class RoomState:
         self.profile1 = profile1
         self.profile2 = profile2
         self.channels = channels
-        base = base_dir if base_dir is not None else (Path.home() / ".ccoral" / "rooms")
+        base = base_dir if base_dir is not None else ROOMS_ARCHIVE
         self.dir = base / room_id
         self.dir.mkdir(parents=True, exist_ok=True)
         self.config_path = self.dir / "config.yaml"
@@ -925,7 +925,7 @@ def _list_room_dirs(base: "Path | None" = None) -> list:
     mtime is more forgiving for clock skew). Filters out non-dirs and
     obvious stragglers (no meta.yaml).
     """
-    base = base if base is not None else (Path.home() / ".ccoral" / "rooms")
+    base = base if base is not None else ROOMS_ARCHIVE
     if not base.exists():
         return []
     entries = []
@@ -1055,7 +1055,7 @@ def _resolve_room_id(room_id: str, base: "Path | None" = None) -> "Path | None":
         return None
     if room_id == "last":
         return dirs[0]
-    base = base if base is not None else (Path.home() / ".ccoral" / "rooms")
+    base = base if base is not None else ROOMS_ARCHIVE
     exact = base / room_id
     if exact.exists() and exact.is_dir():
         return exact

@@ -234,6 +234,28 @@ def send_to_pane(session: str, message: str):
     )
 
 
+def pane_for_profile(panes: dict, target: str):
+    """Resolve `/to <target>` to a session name.
+
+    Accepts either the bare profile name ("blank") or the per-pane suffix
+    ("blank-1", "blank-2") that the plan's verification commands use. If
+    no match, returns None.
+    """
+    if target in panes:
+        return panes[target]
+    # `<profile>-1` / `<profile>-2` short forms.
+    keys = list(panes.keys())
+    if target == f"{keys[0]}-1" or target == "1":
+        return panes[keys[0]]
+    if len(keys) > 1 and (target == f"{keys[1]}-2" or target == "2"):
+        return panes[keys[1]]
+    # Case-insensitive fallback.
+    for k, v in panes.items():
+        if k.lower() == target.lower():
+            return v
+    return None
+
+
 def save_conversation(messages: list, profiles: list) -> Path:
     """Save conversation log to archive."""
     ROOMS_ARCHIVE.mkdir(parents=True, exist_ok=True)
@@ -349,7 +371,7 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
             send_to_pane(panes[profile2], context)
 
         room_control.render_transcript_line(
-            "ROOM", "relay active — watching for responses", DIM,
+            "ROOM", "relay active — watching for responses (try /help)", DIM,
         )
 
         # Turn tracking — who we expect to respond next
@@ -357,11 +379,137 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
         expecting = profile1 if topic else None
         last_speaker = None
 
+        # Phase 1 cockpit state
+        paused = False
+        end_after_turn = False
+        # `speaking` tracks profiles whose response file has changed but
+        # has not yet settled+relayed. While non-empty, user events are
+        # queued instead of dispatched immediately.
+        speaking: set = set()
+        # Quiet-tick counter — when no mtime changes are observed, we
+        # bump this; once it crosses a small threshold we flush queued
+        # user events even if `speaking` is empty (Phase 2 will swap
+        # this heuristic for a real stop_reason signal).
+        quiet_ticks = 0
+
+        # ─── inner helpers (close over panes/messages/etc.) ────────────
+
+        def _say_to_both(text: str) -> None:
+            """Relay event: log once, send to both panes once. Not typed
+            into pane as a Claude prompt — sent directly via send_to_pane.
+            """
+            messages.append({
+                "name": USER_NAME,
+                "text": text,
+                "time": datetime.now().isoformat(),
+            })
+            room_control.render_transcript_line(USER_NAME, text, W)
+            send_to_pane(panes[profile1], f"[{USER_NAME}] {text}")
+            send_to_pane(panes[profile2], f"[{USER_NAME}] {text}")
+
+        def _inject_to(target: str, text: str) -> None:
+            sess = pane_for_profile(panes, target)
+            if sess is None:
+                room_control.render_transcript_line(
+                    "ROOM", f"unknown target: {target}", DIM,
+                )
+                return
+            messages.append({
+                "name": USER_NAME,
+                "text": text,
+                "time": datetime.now().isoformat(),
+                "to": target,
+            })
+            room_control.render_transcript_line(
+                USER_NAME, f"(→ {target}) {text}", W,
+            )
+            send_to_pane(sess, f"[{USER_NAME}] {text}")
+
+        def _open_transcript_pager() -> None:
+            """Spawn `less -R` on the live transcript file."""
+            tmp = ROOM_DIR / "transcript.live.txt"
+            try:
+                with open(tmp, "w") as fh:
+                    for m in messages:
+                        fh.write(f"{m.get('name', '?')}: {m.get('text', '')}\n\n")
+                room_control.teardown_split_screen()
+                subprocess.run(["less", "-R", str(tmp)])
+                room_control.setup_split_screen()
+            except Exception as e:
+                room_control.render_transcript_line(
+                    "ROOM", f"transcript pager failed: {e}", DIM,
+                )
+
+        def _dispatch(event: tuple) -> bool:
+            """Dispatch a user event. Returns True if the loop should keep
+            running, False if we should break immediately.
+            """
+            nonlocal paused, end_after_turn
+            kind = event[0]
+            if kind == "say":
+                _say_to_both(event[1])
+            elif kind == "inject":
+                _inject_to(event[1], event[2])
+            elif kind == "pause":
+                paused = True
+                room_control.render_transcript_line("ROOM", "paused", DIM)
+            elif kind == "resume":
+                paused = False
+                room_control.render_transcript_line("ROOM", "resumed", DIM)
+            elif kind == "end-after-turn":
+                end_after_turn = True
+                room_control.render_transcript_line(
+                    "ROOM", "ending after current turn...", DIM,
+                )
+            elif kind == "stop":
+                room_control.render_transcript_line("ROOM", "stop", DIM)
+                return False
+            elif kind == "save-now":
+                try:
+                    p = save_conversation(messages, [profile1, profile2])
+                    room_control.render_transcript_line(
+                        "ROOM", f"saved: {p}", DIM,
+                    )
+                except Exception as e:
+                    room_control.render_transcript_line(
+                        "ROOM", f"save failed: {e}", DIM,
+                    )
+            elif kind == "transcript":
+                _open_transcript_pager()
+            elif kind == "help":
+                room_control.render_help()
+            else:
+                room_control.render_transcript_line(
+                    "ROOM", f"unknown event: {event!r}", DIM,
+                )
+            return True
+
+        # ───────────────────────────────────────────────────────────────
+
         try:
             while True:
+                # 1) Drain any input the user typed since last tick.
+                #    If a profile is currently mid-stream (or paused), the
+                #    event is queued and flushed later.
+                while True:
+                    cmd = room_control.read_command(timeout=0)
+                    if cmd is None:
+                        break
+                    if cmd[0] in ("pause", "resume", "stop", "end-after-turn",
+                                  "save-now", "transcript", "help"):
+                        # Control commands always run immediately.
+                        if not _dispatch(cmd):
+                            raise KeyboardInterrupt
+                    elif speaking or paused:
+                        room_control.enqueue_user_event(cmd)
+                    else:
+                        if not _dispatch(cmd):
+                            raise KeyboardInterrupt
+
                 time.sleep(POLL_INTERVAL)
 
-                # Check response files for changes
+                # 2) Check response files for changes.
+                tick_observed_change = False
                 check_order = [profile1, profile2]
                 for name in check_order:
                     fpath = files[name]
@@ -372,7 +520,10 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                     if current_mtime <= mtimes[name]:
                         continue
 
-                    # File changed — wait for write to settle
+                    # File changed — mark this profile as speaking, wait
+                    # for the write to settle.
+                    tick_observed_change = True
+                    speaking.add(name)
                     time.sleep(SETTLE_TIME)
 
                     # Re-check mtime in case still writing
@@ -388,6 +539,7 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                         continue
 
                     if not response:
+                        speaking.discard(name)
                         continue
 
                     display = get_display_name(name)
@@ -402,29 +554,58 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
 
                     # Render to the cockpit transcript — full text, soft-wrapped.
                     room_control.render_transcript_line(display, response, color)
+                    last_speaker = name
 
-                    # Relay to the OTHER session
-                    other = profile2 if name == profile1 else profile1
-                    other_session = panes[other]
+                    # Relay to the OTHER session — gated by `paused`.
+                    if not paused:
+                        other = profile2 if name == profile1 else profile1
+                        other_session = panes[other]
 
-                    # For multi-line responses, write to file and send read instruction
-                    # This preserves paragraph structure instead of flattening.
-                    # (Phase 2 replaces this leaky relay with tmux paste-buffer.)
-                    if "\n" in response and len(response) > 200:
-                        relay_file = ROOM_DIR / f"from_{name}.txt"
-                        relay_file.write_text(f"[{display}] {response}")
-                        send_to_pane(other_session,
-                                     f"Read /tmp/ccoral-room/from_{name}.txt")
-                    else:
-                        clean = response.replace("\n", " ").replace("\r", "")
-                        relay_msg = f"[{display}] {clean}"
-                        send_to_pane(other_session, relay_msg)
+                        # For multi-line responses, write to file and send read
+                        # instruction. (Phase 2 replaces this leaky relay with
+                        # tmux paste-buffer; Phase 1 leaves the mechanic intact.)
+                        if "\n" in response and len(response) > 200:
+                            relay_file = ROOM_DIR / f"from_{name}.txt"
+                            relay_file.write_text(f"[{display}] {response}")
+                            send_to_pane(other_session,
+                                         f"Read /tmp/ccoral-room/from_{name}.txt")
+                        else:
+                            clean = response.replace("\n", " ").replace("\r", "")
+                            relay_msg = f"[{display}] {clean}"
+                            send_to_pane(other_session, relay_msg)
 
                     # Clear the captured response file
                     try:
                         fpath.unlink()
                     except Exception:
                         pass
+
+                    # This profile finished its turn for relay purposes.
+                    speaking.discard(name)
+
+                    # 3) Flush queued user events — turn just landed.
+                    if not paused:
+                        for ev in room_control.drain_user_events():
+                            if not _dispatch(ev):
+                                raise KeyboardInterrupt
+
+                # 4) Quiet-tick handling — if nothing changed and the
+                #    queue is non-empty, flush after a short quiet window.
+                if not tick_observed_change:
+                    quiet_ticks += 1
+                    if (quiet_ticks >= 2 and not paused
+                            and room_control.queue_depth() > 0
+                            and not speaking):
+                        for ev in room_control.drain_user_events():
+                            if not _dispatch(ev):
+                                raise KeyboardInterrupt
+                        quiet_ticks = 0
+                else:
+                    quiet_ticks = 0
+
+                # 5) End-after-turn honored once nobody is mid-stream.
+                if end_after_turn and not speaking:
+                    break
 
         except KeyboardInterrupt:
             pass

@@ -85,9 +85,6 @@ topic demands more. Just talk. Don't use tools, don't write files, don't use mar
 Be present in the conversation.
 
 If you see "[{USER_NAME}]" — that is the human host interjecting. Acknowledge them naturally.
-
-When you see "Read /tmp/ccoral-room/" — read that file, it contains a longer message from
-{other_display}. Respond to its contents.
 """
 
         modified_inject = base.get("inject", "") + room_instructions
@@ -234,6 +231,81 @@ def send_to_pane(session: str, message: str):
     )
 
 
+# Tmux's paste-buffer is roughly bounded by the buffer-size config (default
+# ~1MB on most builds, sometimes lower on older systems). 256KB per chunk
+# is comfortably under any limit we'll hit and keeps each subprocess hand-off
+# cheap. Chunks are pasted in order with no extra newline between them
+# (paste-buffer is verbatim) — only the final paste is followed by Enter.
+_TMUX_BUFFER_CHUNK = 256 * 1024
+
+
+def relay_via_paste_buffer(session: str, text: str, buffer_name: str) -> None:
+    """Relay a multi-line message into a tmux pane via load-buffer + paste-buffer.
+
+    This replaces the legacy "read-this-tmpfile" instruction relay that
+    exposed plumbing to the receiving model and caused meta-confused
+    replies. The paste-buffer route preserves multi-line structure verbatim
+    without any in-context instruction.
+
+    For very large turns (>256KB) we chunk the load-buffer call so we don't
+    bump into tmux's per-buffer ceiling. Each chunk uses a unique buffer
+    name suffix so a partial failure is obvious from `tmux list-buffers`.
+    Buffers are deleted once the paste lands.
+    """
+    if not text:
+        return
+
+    # Single-shot fast path — no chunking needed for small relays.
+    if len(text) <= _TMUX_BUFFER_CHUNK:
+        subprocess.run(
+            ["tmux", "load-buffer", "-b", buffer_name, "-"],
+            input=text, text=True, capture_output=True,
+        )
+        subprocess.run(
+            ["tmux", "paste-buffer", "-b", buffer_name, "-t", session],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["tmux", "delete-buffer", "-b", buffer_name],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session, "Enter"],
+            capture_output=True,
+        )
+        return
+
+    # Chunked path. Paste-buffer preserves bytes verbatim, so we MUST NOT
+    # add separators between chunks — splice points are invisible to the
+    # receiving pane. Send Enter once after the last chunk lands.
+    total = len(text)
+    sent = 0
+    chunk_idx = 0
+    while sent < total:
+        end = min(sent + _TMUX_BUFFER_CHUNK, total)
+        chunk = text[sent:end]
+        chunk_buf = f"{buffer_name}-{chunk_idx}"
+        subprocess.run(
+            ["tmux", "load-buffer", "-b", chunk_buf, "-"],
+            input=chunk, text=True, capture_output=True,
+        )
+        subprocess.run(
+            ["tmux", "paste-buffer", "-b", chunk_buf, "-t", session],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["tmux", "delete-buffer", "-b", chunk_buf],
+            capture_output=True,
+        )
+        sent = end
+        chunk_idx += 1
+
+    subprocess.run(
+        ["tmux", "send-keys", "-t", session, "Enter"],
+        capture_output=True,
+    )
+
+
 def pane_for_profile(panes: dict, target: str):
     """Resolve `/to <target>` to a session name.
 
@@ -314,6 +386,12 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
       0.1 = bottom-left (control)
       0.2 = right (profile2 Claude)
     """
+    # Per-run room id used to namespace tmux paste buffers so two rooms
+    # running concurrently don't trample each other's relay payloads.
+    # Phase 3 replaces this synthetic id with the real `RoomConfig.room_id`.
+    room_id = f"{profile1}-{profile2}-{int(time.time())}"
+    turn_seq = 0
+
     # Response file paths
     p1_file = ROOM_DIR / f"{profile1}_response.txt"
     p2_file = ROOM_DIR / f"{profile2}_response.txt"
@@ -592,22 +670,20 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                     last_speaker = name
 
                     # Relay to the OTHER session — gated by `paused`.
+                    # Phase 2: paste-buffer relay. Multi-line structure is
+                    # preserved verbatim; the previous "Read /tmp/..." leak
+                    # that put plumbing into the model's working memory is
+                    # gone. Format is the human-prefix the inject already
+                    # describes: `[<SPEAKER>] <text>`.
                     if not paused:
                         other = profile2 if name == profile1 else profile1
                         other_session = panes[other]
-
-                        # For multi-line responses, write to file and send read
-                        # instruction. (Phase 2 replaces this leaky relay with
-                        # tmux paste-buffer; Phase 1 leaves the mechanic intact.)
-                        if "\n" in response and len(response) > 200:
-                            relay_file = ROOM_DIR / f"from_{name}.txt"
-                            relay_file.write_text(f"[{display}] {response}")
-                            send_to_pane(other_session,
-                                         f"Read /tmp/ccoral-room/from_{name}.txt")
-                        else:
-                            clean = response.replace("\n", " ").replace("\r", "")
-                            relay_msg = f"[{display}] {clean}"
-                            send_to_pane(other_session, relay_msg)
+                        relay_text = f"[{display}] {response}"
+                        turn_seq += 1
+                        buffer_name = f"ccoral-room-{room_id}-{turn_seq}"
+                        relay_via_paste_buffer(
+                            other_session, relay_text, buffer_name,
+                        )
 
                     # Clear the captured response file
                     try:
@@ -699,18 +775,13 @@ def export_conversation(resume: str, output: str = None) -> Path:
             except json.JSONDecodeError:
                 pass
 
-        # Skip relay artifacts — messages about missing files, plumbing complaints
-        # (these are the room negotiating with itself, not the conversation)
-        skip_phrases = [
-            "relay file",
-            "vonnegut_response.txt",
-            "leguin_response.txt",
-            "_response.txt",
-            "plumbing needs adjusting",
-            "isn't configured to drop responses",
-        ]
-        if any(phrase in text.lower() for phrase in skip_phrases):
-            continue
+        # Phase 2: the old string-match export filter that lived here is
+        # gone. It existed to drop transcript lines where a model echoed
+        # our tmpfile-read plumbing back at us — the leak is gone
+        # (paste-buffer relay) and so is the filter. Task 2.4 adds a
+        # structured `kind: "relay-meta"` marker so meta lines
+        # (backpressure SYSTEM messages, [CASSIUS] interjections) can be
+        # filtered without string matching.
 
         # Format the speaker
         if name == USER_NAME:

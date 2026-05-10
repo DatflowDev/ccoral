@@ -363,6 +363,8 @@ def _parse_room_args(args: list) -> dict:
         "seed2": None,
         "moderator": None,
         "moderator_cadence": None,
+        # Phase 5
+        "resume_tail": None,
     }
 
     def _need_value(flag: str, peek_i: int) -> str:
@@ -444,6 +446,11 @@ def _parse_room_args(args: list) -> dict:
                 _need_value("--moderator-cadence", i + 1),
             )
             i += 2
+        elif a == "--resume-tail":
+            out["resume_tail"] = _need_int(
+                "--resume-tail", _need_value("--resume-tail", i + 1),
+            )
+            i += 2
         elif a == "ls":
             # `ccoral room ls` — list rooms. Subverb position only.
             if not out["profiles"] and not out["topic_parts"]:
@@ -499,6 +506,8 @@ def _build_room_config(parsed: dict):
         kwargs["moderator"] = parsed["moderator"]
     if parsed["moderator_cadence"] is not None:
         kwargs["moderator_cadence"] = parsed["moderator_cadence"]
+    if parsed["resume_tail"] is not None:
+        kwargs["resume_tail"] = parsed["resume_tail"]
     return RoomConfig(**kwargs)
 
 

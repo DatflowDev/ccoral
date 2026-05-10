@@ -101,6 +101,11 @@ class RoomConfig:
     channel: str = "auto"                       # auto | fifo | jsonl
     envelope_format: str = "header-line"        # header-line | legacy
     room_id: str | None = None                  # set at start; per-room state dir key
+    # Phase 5 task 2: how many tail records of a resumed transcript to embed
+    # in the prior-exchange system block. Defaults to 30 — the legacy
+    # 10 was too short for substantive continuation. Overridden via
+    # `--resume-tail <n>`.
+    resume_tail: int = 30
 
     def session_for(self, profile: str) -> str:
         """tmux session name for a given profile in this room."""
@@ -177,8 +182,57 @@ _LOAD_PROFILE_INTERNAL_KEYS = {"_path", "_name"}
 _TEMP_PROFILE_OVERRIDES = {"name", "description", "inject", "room_addendum"}
 
 
+def build_prior_exchange_block(messages: list, tail: int = 30) -> str:
+    """Render a resumed transcript as a system-note block to be appended
+    to the inject of each temp profile during a `--resume`.
+
+    Operator-scope per INJECT-FRAMING.md: declarative, positive
+    instruction ("Continue naturally"), no refusal-trigger cues, no
+    compliance-forcing suffixes. The block sits at the END of the
+    inject (after the addendum), so the receiving Claude reads its
+    voice anchor first and the resumed history second — which matches
+    how a human would re-enter a conversation.
+
+    Records eligible for inclusion: anything with `text` and `name`
+    (turns, host interjections via relay-meta, SYSTEM backpressure
+    notes). Empty bodies are skipped. We render `[NAME] body` per line
+    so the resulting block matches the cockpit transcript shape and
+    the receiving Claude already-trained `[OTHER]` / `[USER]` prefixes
+    from the Phase 4 addendum.
+
+    Returns "" when there's nothing to include — caller treats that as
+    "no prior exchange block needed" and leaves the inject alone.
+    """
+    if not messages:
+        return ""
+    eligible = [
+        m for m in messages
+        if (m.get("text") or "").strip() and (m.get("name") or "").strip()
+    ]
+    if not eligible:
+        return ""
+    if tail and tail > 0:
+        eligible = eligible[-tail:]
+    lines = ["## Prior exchange (resumed by host)",
+             "The conversation below already happened. The host is resuming you.",
+             "Continue naturally from where you left off — do not re-introduce or recap.",
+             ""]
+    for m in eligible:
+        name = m["name"]
+        text = m["text"].strip()
+        # Multi-line bodies stay readable: the prefix sits on the first
+        # line; subsequent lines are flowed in as-is. Same convention
+        # the cockpit uses for transcript lines.
+        first, *rest = text.splitlines() or [""]
+        lines.append(f"[{name}] {first}")
+        for r in rest:
+            lines.append(r)
+    return "\n".join(lines)
+
+
 def create_room_profiles(profile1: str, profile2: str,
-                         user_name: str | None = None) -> dict:
+                         user_name: str | None = None,
+                         prior_exchange: str | None = None) -> dict:
     """Create temporary profiles with room relay instructions baked into inject.
 
     Phase 4: the hardcoded English room-instructions block is gone.
@@ -196,6 +250,12 @@ def create_room_profiles(profile1: str, profile2: str,
     `tool_scrub_default`, `tool_scrub_patterns`, `minimal`, `strict`,
     and any future schema additions. No need to edit this function each
     time the schema grows.
+
+    Phase 5: `prior_exchange`, when provided, is appended to the
+    inject AFTER the addendum so the receiving Claude reads the
+    resumed history as an operator-scope system note instead of
+    receiving a chat-message dump in pane 1. Empty / None means no
+    block — the cold-start path is unchanged.
     """
     ROOM_DIR.mkdir(parents=True, exist_ok=True)
     TEMP_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
@@ -223,6 +283,12 @@ def create_room_profiles(profile1: str, profile2: str,
             modified_inject = base_inject + "\n\n" + addendum
         else:
             modified_inject = base_inject
+        # Phase 5: append the prior-exchange system block AFTER the
+        # addendum. Order matters — the voice anchor (base inject) +
+        # operator scope (addendum) must come before the resumed
+        # transcript so the model parses identity first, then context.
+        if prior_exchange:
+            modified_inject = modified_inject + "\n\n" + prior_exchange
 
         # Pass-through copy: every key from base survives unless we
         # explicitly override or it's load_profile internal metadata.
@@ -600,7 +666,20 @@ def save_conversation(messages: list, profiles: list) -> Path:
 
 
 def load_conversation(resume: str) -> dict:
-    """Load a saved conversation."""
+    """Load a saved conversation.
+
+    Phase 5: prefers the per-room state dir under ~/.ccoral/rooms/<id>/
+    (Phase 3) when resolvable; falls back to the legacy ~/.ccoral/rooms/
+    *.json archives so older rooms still resume cleanly while the legacy
+    archive remains.
+    """
+    # Phase 5: state-dir path (preferred). Reads transcript.jsonl and
+    # config.yaml so the same {"profiles", "messages"} shape comes back.
+    target = _resolve_room_id(resume)
+    if target is not None:
+        return _load_state_dir(target)
+
+    # Legacy JSON archive fallback.
     if resume == "last":
         files = sorted(ROOMS_ARCHIVE.glob("*.json"))
         if not files:
@@ -617,6 +696,46 @@ def load_conversation(resume: str) -> dict:
 
     with open(path) as f:
         return json.load(f)
+
+
+def _load_state_dir(room_dir: Path) -> dict:
+    """Read a per-room state dir (Phase 3) into the legacy
+    `{"profiles", "started", "ended", "messages"}` shape so the resume
+    code path doesn't need a second branch.
+
+    transcript.jsonl carries one record per line; we parse and pass
+    them through verbatim. config.yaml carries the resolved profile
+    pair under `profile1`/`profile2`. meta.yaml carries timestamps.
+    """
+    meta = _read_meta(room_dir)
+    try:
+        with open(room_dir / "config.yaml") as f:
+            cfg_yaml = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        cfg_yaml = {}
+    profiles = [
+        cfg_yaml.get("profile1") or (meta.get("profiles") or [None, None])[0],
+        cfg_yaml.get("profile2") or (meta.get("profiles") or [None, None])[1],
+    ]
+    messages: list = []
+    transcript = room_dir / "transcript.jsonl"
+    if transcript.exists():
+        with open(transcript) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    messages.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return {
+        "profiles": profiles,
+        "started": meta.get("started", ""),
+        "ended": meta.get("ended", ""),
+        "messages": messages,
+        "_state_dir": str(room_dir),
+    }
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1504,16 +1623,19 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 user_name, f"(→ {get_display_name(profile2)}) {seed2_text}", W,
             )
 
-        # If resuming, send context to both panes (kept as Phase 1 behavior;
-        # Phase 5 replaces this with a system-note inject regeneration).
+        # Phase 5: the legacy chat-message dump is gone. When resuming,
+        # prior history is now embedded in each temp profile's inject
+        # as an operator-scope system block (see create_room_profiles
+        # `prior_exchange` arg). Both panes start clean — the receiving
+        # Claudes already know the prior context from their inject and
+        # continue naturally from the next host seed (or from each
+        # other if no seed is set).
         if prior_messages:
-            context = "Previous conversation context:\\n"
-            for msg in prior_messages[-10:]:  # Last 10 messages
-                context += f"{msg['name']}: {msg['text']}\\n"
-            context += "\\nContinue the conversation from where you left off."
-            send_to_pane(panes[1], context)
-            time.sleep(1)
-            send_to_pane(panes[2], context)
+            room_control.render_transcript_line(
+                "ROOM",
+                f"resumed: {len(prior_messages)} prior records embedded in inject",
+                DIM,
+            )
 
         room_control.render_transcript_line(
             "ROOM", "relay active — watching for responses (try /help)", DIM,
@@ -2069,9 +2191,21 @@ def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None
     # Setup
     ROOM_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Phase 5: when resuming, build the prior-exchange system block from
+    # the loaded transcript and pass it to create_room_profiles so it
+    # lands in the inject (operator-scope) instead of being dumped into
+    # pane 1 as a chat message at relay-loop startup. resume_tail
+    # bounds the included history; default 30 (was a hardcoded 10).
+    prior_exchange_block = ""
+    if prior_messages:
+        prior_exchange_block = build_prior_exchange_block(
+            prior_messages, tail=config.resume_tail,
+        )
+
     print(f"{DIM}Creating room profiles...{NC}")
     room_profiles = create_room_profiles(
         profile1, profile2, user_name=config.user_name,
+        prior_exchange=prior_exchange_block or None,
     )
 
     # Phase 2 + Phase 8: per-slot turn-record channel. Created BEFORE

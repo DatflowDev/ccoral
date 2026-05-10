@@ -299,35 +299,25 @@ if __name__ == "__main__":
             print(f"          got: {got}")
             failures += 1
 
-    # 2. Real captured dumps — validate against everything in ~/.ccoral/logs/
+    # 2. Real captured dumps — RECORD-ONLY validation. The proxy
+    # overwrites these files on live traffic (raw-{profile}-{model}.json
+    # is keyed by profile+model, not by call), so a hard-coded EXPECTED
+    # dict goes stale every time a session runs. We log the detected
+    # lane for every dump for inspection, but the synthetic-fixture
+    # cases above are what assert correctness — they cover every
+    # fingerprint in the catalog.
+    #
+    # Additionally assert that NO captured dump produces an obviously-
+    # wrong classification (a non-empty system prompt should not
+    # classify as `empty_system`, and an empty body should not classify
+    # as anything else).
     print()
-    print("Captured dumps:")
+    print("Captured dumps (record-only — synthetic cases above are the assertion):")
     log_dir = Path.home() / ".ccoral" / "logs"
     dumps = sorted(log_dir.glob("raw-*.json"))
     if not dumps:
         print("  (no dumps available — skipping)")
     else:
-        # Expected lanes for each captured dump, derived by manual inspection
-        # of the system-prompt opener (see _flatten_system inspection above).
-        # If a dump file appears here that's not in EXPECTED, the test
-        # records its detected lane but doesn't fail — useful for new
-        # captures without manual labels.
-        EXPECTED: dict[str, str] = {
-            "raw-eni-claude-hai.json": "empty_system",
-            "raw-eni-claude-opu.json": "main_worker",
-            "raw-eni-claude-son.json": "main_worker",
-            "raw-eni-executor-claude-hai.json": "session_title_generator",
-            "raw-eni-executor-claude-opu.json": "main_worker",
-            "raw-eni-executor-room-claude-hai.json": "main_worker",
-            "raw-eni-executor-room-claude-opu.json": "main_worker",
-            "raw-eni-executor-room-claude-son.json": "subagent_custom",
-            "raw-eni-room-claude-hai.json": "main_worker",
-            "raw-eni-room-claude-opu.json": "main_worker",
-            "raw-eni-supervisor-room-claude-hai.json": "main_worker",
-            "raw-eni-supervisor-room-claude-opu.json": "main_worker",
-            "raw-red-claude-hai.json": "session_title_generator",
-            "raw-red-claude-opu.json": "main_worker",
-        }
         for p in dumps:
             try:
                 with open(p) as f:
@@ -338,13 +328,16 @@ if __name__ == "__main__":
             sys = data.get("system")
             model = data.get("model")
             got = detect_lane(sys, model=model)
-            expected = EXPECTED.get(p.name)
-            if expected is None:
-                print(f"  -    {p.name:50s} {got} (no expected; record-only)")
-            elif got == expected:
-                print(f"  OK   {p.name:50s} {got}")
-            else:
-                print(f"  FAIL {p.name:50s} got={got} expected={expected}")
+            # Compute the actual non-billing length to sanity-check the
+            # empty_system classification.
+            joined = _flatten_system(sys)
+            print(f"  -    {p.name:50s} {got} (len={len(joined)})")
+            # Sanity rule: only empty input should classify as empty_system.
+            if got == "empty_system" and len(joined) > 0:
+                print(f"  FAIL {p.name}: classified empty_system but len={len(joined)}")
+                failures += 1
+            if got != "empty_system" and len(joined) == 0:
+                print(f"  FAIL {p.name}: classified {got} but len=0")
                 failures += 1
 
     print()

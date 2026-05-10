@@ -714,6 +714,8 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 "name": USER_NAME,
                 "text": topic,
                 "time": datetime.now().isoformat(),
+                # Initial host seed — meta from the conversation's POV.
+                "kind": "relay-meta",
             })
             room_control.render_transcript_line(USER_NAME, topic, W)
 
@@ -741,11 +743,14 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
         def _say_to_both(text: str) -> None:
             """Relay event: log once, send to both panes once. Not typed
             into pane as a Claude prompt — sent directly via send_to_pane.
+            Tagged `relay-meta` so export filters can drop interjections
+            cleanly without resorting to string-match heuristics.
             """
             messages.append({
                 "name": USER_NAME,
                 "text": text,
                 "time": datetime.now().isoformat(),
+                "kind": "relay-meta",
             })
             room_control.render_transcript_line(USER_NAME, text, W)
             send_to_pane(panes[profile1], f"[{USER_NAME}] {text}")
@@ -763,6 +768,7 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 "text": text,
                 "time": datetime.now().isoformat(),
                 "to": target,
+                "kind": "relay-meta",
             })
             room_control.render_transcript_line(
                 USER_NAME, f"(→ {target}) {text}", W,
@@ -873,6 +879,7 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 "time": datetime.now().isoformat(),
                 "stop_reason": record.get("stop_reason"),
                 "request_id": record.get("request_id"),
+                "kind": "turn",
             })
             room_control.render_transcript_line(display, text, color)
 
@@ -905,6 +912,7 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                         "text": sys_text,
                         "time": datetime.now().isoformat(),
                         "to": who,
+                        "kind": "relay-meta",
                     })
                     room_control.render_transcript_line("SYSTEM", sys_text, DIM)
 

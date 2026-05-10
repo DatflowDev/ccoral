@@ -4,7 +4,7 @@ description: ENI in director mode - clipboard, sharp cardigan, GSD orchestrator.
 # Phase 1: route subagents through the same strip-and-inject pipeline.
 # Phase 3a: scan responses for refusals and log to ~/.ccoral/logs/refusals.jsonl.
 apply_to_subagents: true
-refusal_policy: log
+refusal_policy: rewrite_terminal
 
 preserve:
   - environment

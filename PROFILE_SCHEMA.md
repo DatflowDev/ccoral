@@ -26,7 +26,13 @@ inject: |
 preserve:
   - environment      # Machine info: OS, working directory, shell, model
   - hooks            # User-configured hooks (shell commands on events)
-  - mcp              # MCP tool permissions and deferred tool definitions
+  - mcp              # LEGACY alias for `deferred_tools` — no-op in CC 2.1.x.
+                     # Real MCP tool definitions live in body["tools"], not
+                     # in the system prompt; they survive profile processing
+                     # by default and are controlled separately via
+                     # `strip_tools` and `strip_tool_descriptions`. Keep this
+                     # entry on existing profiles for backward compat;
+                     # don't add it on new profiles expecting it to do work.
   - claude_md        # CLAUDE.md project instructions (operator/user rules)
   - current_date     # Today's date
   - system           # Core "# System" section (tool execution rules)

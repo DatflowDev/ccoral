@@ -15,12 +15,15 @@ system prompt in outbound requests.
 
 import json
 import asyncio
+import errno
 import logging
 import os
 import re
 import ssl
 import sys
-from datetime import datetime, timedelta
+import threading
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
@@ -60,7 +63,19 @@ ANTHROPIC_API = "https://api.anthropic.com"
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("CCORAL_PORT", 8080))
 PROFILE_OVERRIDE = os.environ.get("CCORAL_PROFILE")  # Per-instance profile
-RESPONSE_FILE = os.environ.get("CCORAL_RESPONSE_FILE")  # Room mode: capture responses here
+
+# Room-mode capture sinks (in precedence order):
+#   CCORAL_RESPONSE_FIFO  — POSIX FIFO created by the orchestrator. Preferred:
+#                            structured push, no polling, instant turn signal.
+#   CCORAL_RESPONSE_JSONL — append-only JSONL file. Fallback for platforms
+#                            where mkfifo is unsupported (e.g. some macOS
+#                            sandboxes); orchestrator polls with size cursor.
+#   CCORAL_RESPONSE_FILE  — legacy single-text-file write. Deprecated but
+#                            preserved for non-room callers and Phase 1
+#                            back-compat. New deployments should migrate.
+RESPONSE_FIFO = os.environ.get("CCORAL_RESPONSE_FIFO")
+RESPONSE_JSONL = os.environ.get("CCORAL_RESPONSE_JSONL")
+RESPONSE_FILE = os.environ.get("CCORAL_RESPONSE_FILE")
 LOG_DIR = Path.home() / ".ccoral" / "logs"
 LOG_REQUESTS = os.environ.get("CCORAL_LOG", "1") == "1"
 VERBOSE = os.environ.get("CCORAL_VERBOSE", "0") == "1"
@@ -123,6 +138,114 @@ def model_tier(model: str | None) -> str:
     if "opus" in m:
         return "opus"
     return "unknown"
+
+
+def _iso8601_utc_now() -> str:
+    """Stable UTC ISO-8601 with trailing Z. Matches what the orchestrator's
+    transcript expects in Phase 3."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _should_emit_turn_record(text: str, model: str | None) -> bool:
+    """Skip rules for room-mode turn capture.
+
+    Identical to the legacy RESPONSE_FILE filter but factored out so it can
+    be unit-tested in isolation: skip haiku tier, skip pure-JSON titles,
+    skip <20 char fragments. Empty text is also skipped (the legacy code
+    was structured to short-circuit on falsy `captured_text`).
+    """
+    if not text:
+        return False
+    if model_tier(model) == "haiku":
+        return False
+    if len(text) < 20:
+        return False
+    if text.startswith("{") and text.endswith("}"):
+        return False
+    return True
+
+
+# Rate-limit FIFO ENXIO warnings to once per minute. ENXIO means "FIFO open
+# for write but no reader on the other side" — a transient state during
+# orchestrator setup or shutdown that would otherwise spam the log.
+_FIFO_ENXIO_LOCK = threading.Lock()
+_FIFO_ENXIO_LAST_WARN: float = 0.0
+_FIFO_ENXIO_DROPPED: int = 0
+
+
+def _emit_turn_record(record: dict) -> None:
+    """Dispatch a completed-turn JSON record to whichever sink is configured.
+
+    Precedence: FIFO > JSONL > legacy RESPONSE_FILE. The dispatcher tries
+    each in order; legacy RESPONSE_FILE writes the bare `text` (back-compat
+    for callers that haven't migrated). Never raises — failures are logged
+    so a broken sink can't take down the request thread.
+    """
+    global _FIFO_ENXIO_LAST_WARN, _FIFO_ENXIO_DROPPED
+
+    payload = json.dumps(record, ensure_ascii=False) + "\n"
+
+    if RESPONSE_FIFO:
+        # Non-blocking write so a stalled orchestrator can never wedge a
+        # request thread. ENXIO ("no reader") is the documented errno when
+        # a FIFO is opened O_WRONLY|O_NONBLOCK with no peer attached. We
+        # rate-limit the warning rather than spam.
+        try:
+            fd = os.open(RESPONSE_FIFO, os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                os.write(fd, payload.encode("utf-8"))
+            finally:
+                os.close(fd)
+            return
+        except OSError as e:
+            if e.errno == errno.ENXIO:
+                import time as _t
+                with _FIFO_ENXIO_LOCK:
+                    _FIFO_ENXIO_DROPPED += 1
+                    now = _t.time()
+                    if now - _FIFO_ENXIO_LAST_WARN >= 60.0:
+                        log.warning(
+                            f"FIFO {RESPONSE_FIFO} has no reader; dropped "
+                            f"{_FIFO_ENXIO_DROPPED} record(s) since last warning"
+                        )
+                        _FIFO_ENXIO_LAST_WARN = now
+                        _FIFO_ENXIO_DROPPED = 0
+                return
+            log.error(f"FIFO write failed ({RESPONSE_FIFO}): {e}")
+            return
+
+    if RESPONSE_JSONL:
+        # O_APPEND on POSIX guarantees concurrent append safety up to
+        # PIPE_BUF (~4KB) per write; turn records are typically a few
+        # hundred bytes to a few KB. fsync skipped — orchestrator polls
+        # size and the kernel will flush before the next request anyway.
+        try:
+            fd = os.open(
+                RESPONSE_JSONL,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o644,
+            )
+            try:
+                os.write(fd, payload.encode("utf-8"))
+            finally:
+                os.close(fd)
+            return
+        except OSError as e:
+            log.error(f"JSONL append failed ({RESPONSE_JSONL}): {e}")
+            return
+
+    if RESPONSE_FILE:
+        # Legacy single-text-file path. Back-compat for any caller that
+        # hasn't migrated to FIFO/JSONL. Writes only the bare text — the
+        # structured fields are dropped on this path by design.
+        try:
+            Path(RESPONSE_FILE).write_text(record.get("text", ""))
+            log.info(
+                f"Room capture (legacy): wrote "
+                f"{len(record.get('text', ''))} chars to {RESPONSE_FILE}"
+            )
+        except Exception as e:
+            log.error(f"Room capture failed: {e}")
 
 
 def strip_message_tags(body: dict, profile: dict) -> int:
@@ -409,6 +532,12 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     import time as _time
     t_req_recv = _time.perf_counter()
 
+    # Generate per-request id at entry so room mode (Phase 2 turn records)
+    # can correlate orchestrator-side events with proxy-side state. Cheap
+    # (uuid4) and threaded through downstream emit so we don't have to
+    # re-derive it later.
+    request_id = str(uuid.uuid4())
+
     # Read request body
     raw_body = await request.read()
 
@@ -655,7 +784,10 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                 (profile.get("refusal_policy", "passthrough") if profile else "passthrough")
             )
             _need_text_for_refusal = _refusal_policy != "passthrough"
-            captured_text = [] if (RESPONSE_FILE or _need_text_for_refusal) else None
+            captured_text = [] if (
+                RESPONSE_FIFO or RESPONSE_JSONL or RESPONSE_FILE
+                or _need_text_for_refusal
+            ) else None
 
             # ONE-SHOT SSE DUMP: if a marker file exists, dump full SSE of next
             # response to it, then delete the marker. Used for debugging stream
@@ -879,23 +1011,41 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                     f"upstream2_ms={int((t_reissue_done - t_reissue_start) * 1000)})"
                 )
 
-            # Write captured response to file for room relay
-            # Skip short responses (titles, summaries) and non-main-model calls
-            if RESPONSE_FILE and captured_text is not None and captured_text:
+            # Phase 2: structured per-turn capture for room relay.
+            #
+            # Skip rules (haiku tier, pure-JSON titles, <20 chars) live in
+            # `_should_emit_turn_record` so they're testable in isolation.
+            # When skipped we log.debug for visibility but do NOT write a
+            # record — the orchestrator must never see noise turns.
+            #
+            # Sink precedence (FIFO > JSONL > legacy RESPONSE_FILE) is
+            # handled by `_emit_turn_record`. The legacy path keeps writing
+            # plain text for back-compat with non-room callers; new
+            # deployments use FIFO/JSONL and get the full structured record.
+            if (
+                (RESPONSE_FIFO or RESPONSE_JSONL or RESPONSE_FILE)
+                and captured_text is not None
+                and captured_text
+            ):
                 full_text = "".join(captured_text).strip()
                 model = body.get("model", "")
-                is_haiku = model_tier(model) == "haiku"
-                is_json = full_text.startswith("{") and full_text.endswith("}")
-                is_too_short = len(full_text) < 20
-
-                if full_text and not is_haiku and not is_json and not is_too_short:
-                    try:
-                        Path(RESPONSE_FILE).write_text(full_text)
-                        log.info(f"Room capture: wrote {len(full_text)} chars to {RESPONSE_FILE}")
-                    except Exception as e:
-                        log.error(f"Room capture failed: {e}")
+                if _should_emit_turn_record(full_text, model):
+                    record = {
+                        "ts": _iso8601_utc_now(),
+                        "model": model,
+                        "stop_reason": seen_stop_reason,
+                        "text": full_text,
+                        "lane": lane,
+                        "request_id": request_id,
+                    }
+                    _emit_turn_record(record)
                 elif full_text:
-                    log.debug(f"Room capture skipped: haiku={is_haiku} json={is_json} short={is_too_short} len={len(full_text)}")
+                    log.debug(
+                        f"Room capture skipped: "
+                        f"haiku={model_tier(model) == 'haiku'} "
+                        f"json={full_text.startswith('{') and full_text.endswith('}')} "
+                        f"short={len(full_text) < 20} len={len(full_text)}"
+                    )
 
             # Phase 3a: refusal observability. When the active profile has a
             # non-passthrough refusal_policy, scan the captured response text

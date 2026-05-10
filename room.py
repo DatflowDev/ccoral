@@ -620,6 +620,195 @@ def load_conversation(resume: str) -> dict:
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# Phase 3 C4: per-room state directory
+# ───────────────────────────────────────────────────────────────────────────
+
+# CCORAL version label for meta.yaml. Pulled lazily from the `ccoral`
+# CLI's VERSION constant when accessible; falls back to "unknown" so a
+# stripped-down install doesn't crash. ccoral imports room.py (not the
+# other way around), so we sniff it via a deferred attribute lookup.
+def _ccoral_version() -> str:
+    try:
+        ccoral_path = SCRIPT_DIR / "ccoral"
+        if ccoral_path.exists():
+            for line in ccoral_path.read_text().splitlines():
+                if line.strip().startswith("VERSION = "):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _profile_sha(profile_name: str) -> str:
+    """Best-effort sha256 of the resolved temp profile YAML for meta.yaml.
+
+    Reads ~/.ccoral/profiles/<name>-room.yaml — the file create_room_profiles
+    just wrote. Returns the first 16 hex chars of the digest (enough to
+    disambiguate runs without bloating the meta file). On any read error
+    returns "unknown".
+    """
+    import hashlib
+    try:
+        path = TEMP_PROFILES_DIR / f"{profile_name}-room.yaml"
+        if not path.exists():
+            return "unknown"
+        return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    except Exception:
+        return "unknown"
+
+
+def _make_room_id(profile1: str, profile2: str) -> str:
+    """`<timestamp>_<p1>-<p2>` matching the legacy archive filename scheme.
+
+    Duplicate-profile case (`room blank blank`) shares the prefix shape
+    — slot disambiguation already happens elsewhere (Phase 8 sink paths,
+    slot-keyed routing); the room id just needs to be unique per launch,
+    which the timestamp guarantees down to the second.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    return f"{timestamp}_{profile1}-{profile2}"
+
+
+class RoomState:
+    """Per-room state directory under ~/.ccoral/rooms/<id>/.
+
+    Owns three files:
+      config.yaml      — flags + resolved RoomConfig at start (resume key)
+      meta.yaml        — lifecycle: written once at start (state=live),
+                         updated once at exit (state=stopped + exit_reason).
+                         Phase 11's room-watcher polls this `state` field.
+      transcript.jsonl — append-only per-turn record. The room appends
+                         here AFTER consuming a turn from the FIFO/JSONL
+                         channel, NOT the proxy directly — keeps the
+                         channel as single source of truth and avoids a
+                         double-write race.
+
+    The previous-Phase exit-time `save_conversation` JSON write is
+    superseded by the JSONL append + meta.yaml lifecycle. The legacy
+    archive is left in place under ROOMS_ARCHIVE/*.json by run_room
+    so existing `--resume` paths keep working until Phase 5 lands.
+    """
+
+    def __init__(self, room_id: str, config: RoomConfig,
+                 profile1: str, profile2: str,
+                 channels: dict, base_dir: "Path | None" = None):
+        self.room_id = room_id
+        self.config = config
+        self.profile1 = profile1
+        self.profile2 = profile2
+        self.channels = channels
+        base = base_dir if base_dir is not None else (Path.home() / ".ccoral" / "rooms")
+        self.dir = base / room_id
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.config_path = self.dir / "config.yaml"
+        self.meta_path = self.dir / "meta.yaml"
+        self.transcript_path = self.dir / "transcript.jsonl"
+
+    def write_initial(self) -> None:
+        """Write config.yaml + meta.yaml(state=live) + touch transcript.jsonl.
+
+        Called once at room start, after channels are set up but before
+        the relay loop begins. Idempotent — safe to call twice without
+        clobbering an in-progress run, since the meta exit_reason field
+        is only set by `update_exit`.
+        """
+        # config.yaml — every flag the operator set, resolved against
+        # RoomConfig defaults so a `--resume` later sees exactly the
+        # values that were live.
+        config_data = {
+            "room_id": self.room_id,
+            "profile1": self.profile1,
+            "profile2": self.profile2,
+            "config": asdict(self.config),
+        }
+        with open(self.config_path, "w") as f:
+            yaml.dump(config_data, f, default_flow_style=False, allow_unicode=True)
+
+        # meta.yaml — lifecycle + provenance stamped once at start.
+        meta = {
+            "ccoral_version": _ccoral_version(),
+            "room_id": self.room_id,
+            "profiles": [self.profile1, self.profile2],
+            "models": {
+                self.profile1: "auto",
+                self.profile2: "auto",
+            },
+            "profile_shas": {
+                self.profile1: _profile_sha(self.profile1),
+                self.profile2: _profile_sha(self.profile2),
+            },
+            "ports": {
+                "slot1": self.config.base_port,
+                "slot2": self.config.base_port + 1,
+            },
+            "channels": {
+                f"slot{slot}": {"path": str(p), "kind": kind}
+                for slot, (p, kind) in self.channels.items()
+            },
+            "started": datetime.now().isoformat(),
+            "state": "live",
+            "exit_reason": None,
+        }
+        with open(self.meta_path, "w") as f:
+            yaml.dump(meta, f, default_flow_style=False, allow_unicode=True)
+
+        # transcript.jsonl — touch so room ls / show can read it even
+        # for a session that ends before any turn lands.
+        self.transcript_path.touch(exist_ok=True)
+
+    def append_turn(self, record: dict) -> None:
+        """Append one record to transcript.jsonl. Used as the relay_loop
+        `on_turn_committed` callback. One JSON object per line; UTF-8.
+        Caller is the relay loop running on the cockpit worker thread,
+        so we open-write-close per turn — append-only writes are atomic
+        on Linux for buffers under PIPE_BUF, and turn records are tiny.
+        """
+        try:
+            with open(self.transcript_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            # Same swallow policy as the on_turn_committed contract — a
+            # transcript-write failure must never wedge the relay.
+            pass
+
+    def update_exit(self, exit_reason: str) -> None:
+        """Stamp meta.yaml with state=stopped + the resolved exit_reason.
+
+        Reads the existing meta back, mutates the two fields, rewrites.
+        We don't truncate-and-rewrite atomically because a torn write
+        leaves the prior state file intact and Phase 11 just reports
+        "live" for one extra poll cycle — far better than wiping the
+        provenance to write a single field.
+        """
+        try:
+            with open(self.meta_path) as f:
+                meta = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            # write_initial was never called — synthesize a minimal meta.
+            meta = {
+                "ccoral_version": _ccoral_version(),
+                "room_id": self.room_id,
+                "profiles": [self.profile1, self.profile2],
+                "started": None,
+            }
+        meta["state"] = "stopped"
+        meta["exit_reason"] = exit_reason
+        meta["ended"] = datetime.now().isoformat()
+        with open(self.meta_path, "w") as f:
+            yaml.dump(meta, f, default_flow_style=False, allow_unicode=True)
+
+
+def room_ls() -> None:
+    """Phase 3 C5 implements this. Stub for C4 commit boundary."""
+    raise NotImplementedError("room_ls lands in Phase 3 C5")
+
+
+def room_show(room_id: str) -> None:
+    """Phase 3 C5 implements this. Stub for C4 commit boundary."""
+    raise NotImplementedError("room_show lands in Phase 3 C5")
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # Phase 2: turn-record consumers
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -1699,22 +1888,50 @@ def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None
     print(f"{DIM}Setting up tmux sessions '{p1_session}' / '{p2_session}'...{NC}")
     setup_tmux(profile1, profile2, config=config)
 
+    # Phase 3 C4: per-room state directory. Created BEFORE relay_loop so
+    # config.yaml + meta.yaml(state=live) are on disk by the time the
+    # cockpit comes up — Phase 11's live-room watcher only sees rooms
+    # that have already stamped state=live.
+    room_id = _make_room_id(profile1, profile2)
+    config.room_id = room_id  # mirror into config so paste-buffer ns matches
+    state = RoomState(
+        room_id=room_id, config=config,
+        profile1=profile1, profile2=profile2,
+        channels=channels,
+    )
+    state.write_initial()
+    print(f"{DIM}State dir: {state.dir}{NC}")
+
     messages: list = []
     exit_reason = "clean"
     try:
         messages, exit_reason = relay_loop(
             profile1, profile2, topic, prior_messages, channels=channels,
             legacy_cockpit=legacy_cockpit, config=config,
+            on_turn_committed=state.append_turn,
         )
+    except BaseException:
+        # If the relay raised something other than KeyboardInterrupt,
+        # the lifecycle gets stamped as "error" in meta.yaml. KeyboardInterrupt
+        # surfaces as exit_reason="signal" from inside relay_loop, but a
+        # crash above (or before relay_loop returns) needs its own marker.
+        exit_reason = "error"
+        raise
     finally:
         print(f"\n{DIM}Cleaning up...{NC}")
 
-        # Save conversation (legacy archive — Phase 3 C4 replaces this
-        # with the per-room state dir + transcript.jsonl appender; kept
-        # in C1 so behavior is unchanged at this commit boundary).
+        # Phase 3 C4: the per-turn transcript.jsonl is the source of
+        # truth. The legacy save_conversation JSON write is preserved
+        # for one release so existing `--resume` paths keep working
+        # (load_conversation reads .json from ROOMS_ARCHIVE). Phase 5
+        # cuts over resume to the new dir.
         if messages:
             path = save_conversation(messages, [profile1, profile2])
-            print(f"{DIM}Conversation saved: {path}{NC}")
+            print(f"{DIM}Conversation saved (legacy): {path}{NC}")
+        # Stamp the lifecycle ending. state=stopped + exit_reason match
+        # the contract the C6 tests assert against.
+        state.update_exit(exit_reason)
+        print(f"{DIM}Meta stamped: state=stopped exit_reason={exit_reason}{NC}")
 
         # Stop proxies
         stop_proxies(procs)

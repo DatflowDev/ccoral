@@ -798,14 +798,221 @@ class RoomState:
             yaml.dump(meta, f, default_flow_style=False, allow_unicode=True)
 
 
-def room_ls() -> None:
-    """Phase 3 C5 implements this. Stub for C4 commit boundary."""
-    raise NotImplementedError("room_ls lands in Phase 3 C5")
+def _list_room_dirs(base: "Path | None" = None) -> list:
+    """Return per-room state dirs under ~/.ccoral/rooms/, newest first.
+
+    Sorting is by mtime of the dir (matches "started timestamp
+    descending" — the room id prefix is the timestamp anyway, but
+    mtime is more forgiving for clock skew). Filters out non-dirs and
+    obvious stragglers (no meta.yaml).
+    """
+    base = base if base is not None else (Path.home() / ".ccoral" / "rooms")
+    if not base.exists():
+        return []
+    entries = []
+    for child in base.iterdir():
+        if not child.is_dir():
+            continue
+        if not (child / "meta.yaml").exists():
+            continue
+        entries.append(child)
+    entries.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return entries
 
 
-def room_show(room_id: str) -> None:
-    """Phase 3 C5 implements this. Stub for C4 commit boundary."""
-    raise NotImplementedError("room_show lands in Phase 3 C5")
+def _read_meta(room_dir: Path) -> dict:
+    try:
+        with open(room_dir / "meta.yaml") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def _count_turns(room_dir: Path) -> int:
+    """Count `kind == "turn"` records in transcript.jsonl. Lines that
+    fail to parse are silently skipped so a partial-write tail doesn't
+    crash `room ls`.
+    """
+    path = room_dir / "transcript.jsonl"
+    if not path.exists():
+        return 0
+    n = 0
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("kind") == "turn":
+                    n += 1
+    except Exception:
+        pass
+    return n
+
+
+def _last_topic(room_dir: Path) -> str:
+    """Best-effort topic label for `room ls`. Reads the first non-turn
+    record from transcript.jsonl (typically the seed1/seed2 host
+    interjection); falls back to empty string.
+    """
+    path = room_dir / "transcript.jsonl"
+    if not path.exists():
+        return ""
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # The first record is usually the seed (relay-meta /
+                # interject). If the room ran cold, fall through to the
+                # first turn instead.
+                text = (rec.get("text") or "").strip().splitlines()[0:1]
+                if text:
+                    return text[0][:60]
+    except Exception:
+        pass
+    return ""
+
+
+def room_ls(base: "Path | None" = None, stream=None) -> None:
+    """List all rooms under ~/.ccoral/rooms/ in tabular form.
+
+    Columns: id (timestamped), profiles, started, turns, state, topic.
+    Sorted newest first. Output goes to `stream` (default stdout) so
+    tests can capture without monkey-patching.
+    """
+    if stream is None:
+        stream = sys.stdout
+    dirs = _list_room_dirs(base)
+    if not dirs:
+        stream.write("(no rooms found)\n")
+        return
+
+    rows = []
+    for d in dirs:
+        meta = _read_meta(d)
+        profiles = meta.get("profiles") or []
+        prof_label = "x".join(profiles) if profiles else d.name
+        started = meta.get("started", "") or ""
+        # Trim ISO timestamp for display; keep date + HH:MM.
+        started_short = started[:16].replace("T", " ") if started else ""
+        state = meta.get("state", "?")
+        turns = _count_turns(d)
+        topic = _last_topic(d)
+        rows.append((d.name, prof_label, started_short, turns, state, topic))
+
+    headers = ("ID", "PROFILES", "STARTED", "TURNS", "STATE", "TOPIC")
+    widths = [
+        max(len(headers[0]), max(len(r[0]) for r in rows)),
+        max(len(headers[1]), max(len(r[1]) for r in rows)),
+        max(len(headers[2]), max(len(r[2]) for r in rows)),
+        max(len(headers[3]), max(len(str(r[3])) for r in rows)),
+        max(len(headers[4]), max(len(r[4]) for r in rows)),
+        max(len(headers[5]), max(len(r[5]) for r in rows)),
+    ]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    stream.write(fmt.format(*headers) + "\n")
+    for r in rows:
+        stream.write(fmt.format(r[0], r[1], r[2], str(r[3]), r[4], r[5]) + "\n")
+
+
+def _resolve_room_id(room_id: str, base: "Path | None" = None) -> "Path | None":
+    """Map a `<id>|last` token to a room directory.
+
+    "last" → most recent dir. Otherwise: first try the literal id, then
+    a prefix match (so the operator can paste just the timestamp).
+    """
+    dirs = _list_room_dirs(base)
+    if not dirs:
+        return None
+    if room_id == "last":
+        return dirs[0]
+    base = base if base is not None else (Path.home() / ".ccoral" / "rooms")
+    exact = base / room_id
+    if exact.exists() and exact.is_dir():
+        return exact
+    for d in dirs:
+        if d.name.startswith(room_id):
+            return d
+    return None
+
+
+def room_show(room_id: str, base: "Path | None" = None) -> None:
+    """Page the transcript for `<room_id>` in $PAGER (default `less -R`).
+
+    Renders one line per record from transcript.jsonl into a temp file,
+    formatted as `[STATE] NAME: text` so the pager view matches the
+    cockpit transcript reasonably. Color preserved through `less -R`
+    (the only ANSI we currently emit lives in the cockpit, not the
+    archived JSONL — but `-R` is the safe default for future-color).
+
+    `<room_id>` accepts "last" or a full / prefix id. Errors print to
+    stderr and exit 1.
+    """
+    target = _resolve_room_id(room_id, base)
+    if target is None:
+        print(f"{Y}room not found: {room_id}{NC}", file=sys.stderr)
+        sys.exit(1)
+    transcript = target / "transcript.jsonl"
+    if not transcript.exists():
+        print(f"{Y}no transcript at {transcript}{NC}", file=sys.stderr)
+        sys.exit(1)
+
+    # Render to a tempfile so the pager doesn't tie up the JSONL during
+    # an active session.
+    import tempfile
+    tmp = Path(tempfile.NamedTemporaryFile(
+        prefix=f"ccoral-room-{target.name}-", suffix=".txt", delete=False,
+    ).name)
+    with open(tmp, "w", encoding="utf-8") as out:
+        meta = _read_meta(target)
+        out.write(f"# room: {target.name}\n")
+        out.write(f"# profiles: {meta.get('profiles')}\n")
+        out.write(f"# state: {meta.get('state', '?')} "
+                  f"exit_reason: {meta.get('exit_reason')}\n")
+        out.write(f"# started: {meta.get('started', '?')}\n")
+        out.write("\n")
+        try:
+            with open(transcript) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        out.write(f"[malformed] {line}\n")
+                        continue
+                    name = rec.get("name", "?")
+                    text = rec.get("text", "").rstrip()
+                    kind = rec.get("kind", "")
+                    tag = f"[{kind}] " if kind else ""
+                    out.write(f"{tag}{name}: {text}\n\n")
+        except Exception as e:
+            out.write(f"\n(error reading transcript: {e})\n")
+
+    pager = os.environ.get("PAGER", "less -R")
+    # Split on whitespace so PAGER="less -R" vs PAGER=less both work.
+    pager_cmd = pager.split() + [str(tmp)]
+    try:
+        subprocess.run(pager_cmd)
+    except FileNotFoundError:
+        # Fall back to dumping the file if pager isn't installed.
+        sys.stdout.write(tmp.read_text())
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 # ───────────────────────────────────────────────────────────────────────────

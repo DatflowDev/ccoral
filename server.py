@@ -65,6 +65,17 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("CCORAL_PORT", 8080))
 PROFILE_OVERRIDE = os.environ.get("CCORAL_PROFILE")  # Per-instance profile
 
+# Phase 8: room-mode slot identity. The orchestrator sets CCORAL_ROOM_SLOT to
+# "1" or "2" when spawning each proxy so every captured turn carries an
+# unambiguous slot tag — the relay then keys panes/colors/displays by slot
+# rather than inferring speaker from "which sink path changed". Non-room
+# proxy invocations leave it unset and the field serializes as null.
+_ROOM_SLOT_RAW = os.environ.get("CCORAL_ROOM_SLOT")
+try:
+    ROOM_SLOT: int | None = int(_ROOM_SLOT_RAW) if _ROOM_SLOT_RAW else None
+except ValueError:
+    ROOM_SLOT = None
+
 # Room-mode capture sinks (in precedence order):
 #   CCORAL_RESPONSE_FIFO  — POSIX FIFO created by the orchestrator. Preferred:
 #                            structured push, no polling, instant turn signal.
@@ -1043,6 +1054,12 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                 full_text = "".join(captured_text).strip()
                 model = body.get("model", "")
                 if _should_emit_turn_record(full_text, model):
+                    # Phase 8: stamp `profile` and `slot` so the orchestrator
+                    # can attribute the turn without inferring speaker from
+                    # mtime / sink-path identity. `profile` comes from the
+                    # PROFILE_OVERRIDE env (per-instance profile that the
+                    # proxy was launched with); `slot` from CCORAL_ROOM_SLOT
+                    # set by the room launcher (None for non-room callers).
                     record = {
                         "ts": _iso8601_utc_now(),
                         "model": model,
@@ -1050,6 +1067,8 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                         "text": full_text,
                         "lane": lane,
                         "request_id": request_id,
+                        "profile": PROFILE_OVERRIDE,
+                        "slot": ROOM_SLOT,
                     }
                     _emit_turn_record(record)
                 elif full_text:

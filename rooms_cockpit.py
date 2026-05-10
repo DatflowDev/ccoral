@@ -429,6 +429,191 @@ class RoomsCockpit(App):
             else:
                 time.sleep(self.poll_interval)
 
+    # ─── input dispatch ────────────────────────────────────────────────
+
+    @on(Input.Submitted, "#prompt")
+    def on_prompt_submit(self, event: Input.Submitted) -> None:
+        """Operator pressed Enter on the prompt. Parse and dispatch.
+
+        Tabs mode:
+          - plain text     → ("say", text) on the active room's FIFO
+          - "/to <p> <t>"  → ("inject", target=p, text=t) on active
+          - "/room ..."    → ignored (logged) — only meaningful in
+                             unified mode
+
+        Unified mode:
+          - "/room <id> <text>" → ("say", text) on <id>'s FIFO,
+            falling back to ("inject", ...) if "/room <id> /to <p> <t>"
+            is supplied (rare; spec line 584 keeps it simple).
+          - plain text → ("say", text) on last_active_room's FIFO
+            (None if no traffic yet — surface a warn line).
+        """
+        line = event.value
+        event.input.clear()
+        line = line.rstrip("\r\n")
+        if not line.strip():
+            return
+        self.dispatch_command(line)
+
+    def dispatch_command(self, line: str) -> None:
+        """Route a typed line to the right per-room control sink.
+
+        Pure-ish: the only side-effects are FIFO writes (via
+        ``room.write_control_event``) and a per-room transcript
+        annotation rendered to the unified-log + per-room RichLog so
+        the operator sees their input land. Returns nothing.
+        """
+        # /room <id> [body...] — explicit room target. Active in
+        # unified mode; in tabs mode we still honour it because there's
+        # no harm and operators alternate modes mid-session.
+        if line.startswith("/room"):
+            self._dispatch_room_prefix(line)
+            return
+
+        # /to <profile> <text> — inject to one slot.
+        if line.startswith("/to"):
+            target_room = self._resolve_active_target()
+            if target_room is None:
+                self._render_local_warn("no active room for /to")
+                return
+            parts = line.split(maxsplit=2)
+            if len(parts) < 3:
+                self._render_local_warn("usage: /to <profile> <text>")
+                return
+            _, profile, text = parts
+            self._send_event(
+                target_room,
+                {"kind": "inject", "target": profile, "text": text},
+            )
+            return
+
+        # Plain text → ("say", text) on the active or last-active room.
+        target_room = self._resolve_active_target()
+        if target_room is None:
+            self._render_local_warn(
+                "no active room — type `/room <id> <text>` to address one"
+            )
+            return
+        self._send_event(target_room, {"kind": "say", "text": line})
+
+    def _dispatch_room_prefix(self, line: str) -> None:
+        """Parse a `/room <id> <body>` line and dispatch the body."""
+        parts = line.split(maxsplit=2)
+        if len(parts) < 3:
+            self._render_local_warn("usage: /room <id> <text>")
+            return
+        _, room_id, body = parts
+        # Only address rooms we're actively tailing — typing an
+        # unknown id is almost always a typo, not a request to start
+        # tailing a new room mid-session (the cockpit is read-only on
+        # lifecycle per the Phase 11 contract).
+        if room_id not in self.room_ids:
+            self._render_local_warn(f"unknown room id: {room_id}")
+            return
+        body = body.lstrip()
+        if body.startswith("/to"):
+            sub = body.split(maxsplit=2)
+            if len(sub) < 3:
+                self._render_local_warn("usage: /to <profile> <text>")
+                return
+            _, profile, text = sub
+            self._send_event(
+                room_id,
+                {"kind": "inject", "target": profile, "text": text},
+            )
+            return
+        self._send_event(room_id, {"kind": "say", "text": body})
+
+    def _resolve_active_target(self) -> "str | None":
+        """Pick the room a plain-text input is destined for.
+
+        Tabs mode → the currently focused tab.
+        Unified mode → the most recently active room (set by the
+                        RoomLine handler whenever a worker delivers a
+                        new transcript line).
+
+        Falls back to the first room id if nothing else resolves —
+        better than crashing on an empty cockpit, and matches the
+        watch-sidecar's "be forgiving" posture.
+        """
+        if self.unified_mode:
+            if self.last_active_room is not None:
+                return self.last_active_room
+            return self.room_ids[0] if self.room_ids else None
+        active = self._active_room_id()
+        if active is not None:
+            return active
+        return self.room_ids[0] if self.room_ids else None
+
+    def _send_event(self, room_id: str, event: dict) -> None:
+        """Write one event to the per-room control sink and echo a
+        confirmation line into the cockpit transcript so the operator
+        sees their input land even before the relay loop renders it.
+
+        Catches the OSError ``write_control_event`` raises when no
+        consumer is attached to the FIFO (room ended, never started,
+        etc.) and surfaces it as a warn line; the operator can decide
+        whether to retry or address a different room.
+        """
+        from room import write_control_event
+
+        try:
+            write_control_event(room_id, event)
+        except OSError as exc:
+            self._render_local_warn(
+                f"control sink unavailable for {room_id}: {exc}"
+            )
+            return
+        # Echo a small confirmation. Renders to the per-room RichLog
+        # AND the unified-log so the operator sees it in either mode.
+        kind = event.get("kind", "?")
+        if kind == "say":
+            echo_text = event.get("text", "")
+            echo_speaker = self.user_name
+        elif kind == "inject":
+            target = event.get("target", "?")
+            echo_text = event.get("text", "")
+            echo_speaker = f"{self.user_name}→{target}"
+        else:
+            echo_text = json.dumps(event)
+            echo_speaker = self.user_name
+        per_room = (
+            f"  [host]{_escape_markup(echo_speaker)}:[/host] "
+            f"{_escape_markup(echo_text)}"
+        )
+        unified = (
+            f"  [system]\\[{_escape_markup(room_id)}][/system] "
+            f"[host]{_escape_markup(echo_speaker)}:[/host] "
+            f"{_escape_markup(echo_text)}"
+        )
+        try:
+            log = self.query_one(f"#{_log_id(room_id)}", RichLog)
+            log.write(per_room)
+        except Exception:
+            pass
+        try:
+            unified_log = self.query_one("#unified-log", RichLog)
+            unified_log.write(unified)
+        except Exception:
+            pass
+
+    def _render_local_warn(self, text: str) -> None:
+        """Drop a warn-styled line into both the active per-room log
+        and the unified-log. Used for parse errors / no-target cases
+        — purely a UI nudge, no FIFO traffic.
+        """
+        markup = f"  [warn]ROOM:[/warn] {_escape_markup(text)}"
+        active = self._active_room_id()
+        if active is not None:
+            try:
+                self.query_one(f"#{_log_id(active)}", RichLog).write(markup)
+            except Exception:
+                pass
+        try:
+            self.query_one("#unified-log", RichLog).write(markup)
+        except Exception:
+            pass
+
     # ─── message handlers ──────────────────────────────────────────────
 
     def on_room_line(self, message: RoomLine) -> None:
@@ -509,11 +694,40 @@ class RoomsCockpit(App):
     # ─── mode + badge actions ──────────────────────────────────────────
 
     def action_toggle_unified(self) -> None:
-        """C4 lands the real toggle. The binding is wired here so the
-        Footer shows the keystroke from the first commit; the body
-        becomes a real ContentSwitcher-style flip in C4.
+        """Ctrl+U — flip between tabs mode (default) and unified mode.
+
+        Tabs mode shows the TabbedContent and hides the unified-log;
+        unified mode does the inverse. We toggle visibility via the
+        ``hidden`` CSS class rather than reparenting widgets, so per-
+        tab RichLog scroll positions and content are preserved across
+        toggles.
         """
         self.unified_mode = not self.unified_mode
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+        except Exception:
+            tabs = None
+        try:
+            unified = self.query_one("#unified-log", RichLog)
+        except Exception:
+            unified = None
+        if self.unified_mode:
+            if tabs is not None:
+                tabs.add_class("hidden")
+            if unified is not None:
+                unified.remove_class("hidden")
+        else:
+            if tabs is not None:
+                tabs.remove_class("hidden")
+            if unified is not None:
+                unified.add_class("hidden")
+        # Keep the prompt focused so the operator can type immediately
+        # after toggling — TabbedContent grabbing focus on show would
+        # otherwise force an extra keystroke.
+        try:
+            self.query_one("#prompt", Input).focus()
+        except Exception:
+            pass
 
     def action_clear_badges(self) -> None:
         """Ctrl+L — clear every activity badge. Useful after stepping

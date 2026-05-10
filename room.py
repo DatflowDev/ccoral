@@ -15,8 +15,10 @@ Usage (via CLI):
     ccoral room --resume last
 """
 
+import errno
 import json
 import os
+import select
 import sys
 import subprocess
 import time
@@ -47,8 +49,14 @@ TEMP_PROFILES_DIR = Path.home() / ".ccoral" / "profiles"
 TMUX_SESSION = "room"
 BASE_PORT = 8090
 USER_NAME = "CASSIUS"
-POLL_INTERVAL = 2  # seconds between file checks
-SETTLE_TIME = 2    # seconds to wait after file change before relaying
+
+# Phase 2: arbiter loop tick. Short timeout on select(); the loop is push-driven
+# (FIFO bytes wake us instantly), the timeout only governs how often we poll
+# stdin via the cockpit's own line-editor and check stall expiry.
+RELAY_SELECT_TIMEOUT = 0.25
+# Phase 2: backpressure defaults. Phase 3 will make these CLI-configurable.
+BACKPRESSURE_TURNS_DEFAULT = 2
+BACKPRESSURE_TIMEOUT_DEFAULT = 60.0
 
 
 def get_display_name(profile_name: str) -> str:
@@ -117,8 +125,15 @@ def cleanup_room_profiles(profile1: str, profile2: str):
             pass
 
 
-def start_proxies(room_profiles: dict) -> list:
-    """Start two CCORAL proxy instances with room profiles."""
+def start_proxies(room_profiles: dict, channels: dict | None = None) -> list:
+    """Start two CCORAL proxy instances with room profiles.
+
+    `channels`, when provided, maps base_profile_name -> (path, kind). The
+    proxy is told to push completed-turn records there via
+    `CCORAL_RESPONSE_FIFO` (when kind=="fifo") or `CCORAL_RESPONSE_JSONL`
+    (kind=="jsonl"). When `channels` is None we fall back to the legacy
+    `CCORAL_RESPONSE_FILE` path so non-arbiter callers still work.
+    """
     server_path = SCRIPT_DIR / "server.py"
     procs = []
 
@@ -134,8 +149,15 @@ def start_proxies(room_profiles: dict) -> list:
         env["CCORAL_PORT"] = str(port)
         env["CCORAL_PROFILE"] = room_name
         env["CCORAL_LOG"] = "0"
-        # Tell proxy to capture responses for room relay
-        env["CCORAL_RESPONSE_FILE"] = str(ROOM_DIR / f"{base_name}_response.txt")
+        if channels and base_name in channels:
+            ch_path, ch_kind = channels[base_name]
+            if ch_kind == "fifo":
+                env["CCORAL_RESPONSE_FIFO"] = str(ch_path)
+            else:
+                env["CCORAL_RESPONSE_JSONL"] = str(ch_path)
+        else:
+            # Legacy fallback for non-arbiter callers.
+            env["CCORAL_RESPONSE_FILE"] = str(ROOM_DIR / f"{base_name}_response.txt")
         # Make sure proxies hit the real API, not any existing proxy
         env.pop("ANTHROPIC_BASE_URL", None)
 
@@ -377,9 +399,248 @@ def load_conversation(resume: str) -> dict:
         return json.load(f)
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# Phase 2: turn-record consumers
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class _FifoReader:
+    """Line-buffered non-blocking reader over a POSIX FIFO.
+
+    Why this exists: FIFOs deliver bytes when the writer flushes, and a JSONL
+    record may straddle a single `read()` call. We accumulate bytes and yield
+    only complete `\\n`-terminated lines.
+
+    Open mode O_RDONLY|O_NONBLOCK so the caller can `select.select` on the
+    fd. The proxy side opens the same FIFO O_WRONLY|O_NONBLOCK at emit time
+    and writes one record at a time; ENXIO on the write side just means we
+    weren't ready to read yet (rate-limited warning, dropped record).
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        # O_NONBLOCK on read side requires a writer to ever attach; if no
+        # one's there yet, open returns immediately and reads will return
+        # b"" until bytes arrive.
+        self.fd = os.open(str(self.path), os.O_RDONLY | os.O_NONBLOCK)
+        self._buf = b""
+
+    def fileno(self) -> int:
+        return self.fd
+
+    def read_lines(self) -> list:
+        """Drain whatever bytes are currently available; return any complete
+        `\\n`-terminated lines as decoded str (no trailing newline). Partial
+        tail bytes stay buffered for the next call.
+        """
+        out = []
+        while True:
+            try:
+                chunk = os.read(self.fd, 65536)
+            except BlockingIOError:
+                break
+            except OSError as e:
+                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    break
+                raise
+            if not chunk:
+                # EOF on FIFO means all writers closed. With force_close
+                # proxies that's transient; the next writer-open re-arms us.
+                break
+            self._buf += chunk
+        while b"\n" in self._buf:
+            line, self._buf = self._buf.split(b"\n", 1)
+            if line.strip():
+                out.append(line.decode("utf-8", errors="replace"))
+        return out
+
+    def close(self) -> None:
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+class _JsonlTailReader:
+    """Polled tail-reader over a JSONL file, used when FIFO support isn't
+    available on the host. We track byte offset and re-open on each tick.
+
+    Concurrent O_APPEND from the proxy means the file only ever grows;
+    `os.path.getsize` is the tail cursor.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.touch(exist_ok=True)
+        self._offset = self.path.stat().st_size
+        self._buf = b""
+
+    def fileno(self) -> int | None:
+        # No fd to select on — caller polls.
+        return None
+
+    def read_lines(self) -> list:
+        try:
+            size = self.path.stat().st_size
+        except FileNotFoundError:
+            return []
+        if size <= self._offset:
+            return []
+        out = []
+        with open(self.path, "rb") as f:
+            f.seek(self._offset)
+            chunk = f.read(size - self._offset)
+            self._offset = size
+        self._buf += chunk
+        while b"\n" in self._buf:
+            line, self._buf = self._buf.split(b"\n", 1)
+            if line.strip():
+                out.append(line.decode("utf-8", errors="replace"))
+        return out
+
+    def close(self) -> None:
+        pass
+
+
+class TurnArbiter:
+    """Strict turn ordering driven by proxy `stop_reason` signals.
+
+    State per profile: `idle` (no pending turn), `speaking` (mid-stream,
+    relay deferred until end_turn). Only one profile may be `speaking` at
+    a time — concurrent `message_start` events from both sides land on the
+    arbiter and the second one is queued until the first finishes.
+
+    Backpressure: per profile, count `consecutive_solo_turns` — turns
+    produced without the other side replying. On hitting the cap, we
+    inject a `[SYSTEM] {other} hasn't replied yet — pausing.` message
+    into the speaker's pane and stall further relays until either:
+      - the timeout expires,
+      - the user issues `/resume`,
+      - or the other side produces a turn.
+
+    The arbiter does NOT do the actual relay or pane I/O — it returns
+    decisions (relay this text, inject this system message, pause).
+    The relay_loop applies them. Keeps the class testable in isolation.
+    """
+
+    # Decision kinds returned from on_turn_record / tick.
+    RELAY = "relay"             # ("relay", text, target_profile)
+    BACKPRESSURE = "system"     # ("system", text, speaker_profile)
+    RESUME = "resume"           # ("resume", speaker_profile)
+
+    def __init__(
+        self,
+        profile1: str,
+        profile2: str,
+        backpressure_turns: int = BACKPRESSURE_TURNS_DEFAULT,
+        backpressure_timeout: float = BACKPRESSURE_TIMEOUT_DEFAULT,
+    ):
+        self.profile1 = profile1
+        self.profile2 = profile2
+        self.cap = max(1, backpressure_turns)
+        self.timeout = backpressure_timeout
+
+        # Per-profile speaking state — currently used for visibility; the
+        # `stop_reason: end_turn` arrival IS the speaking-end signal, so
+        # we don't track per-chunk presence here.
+        self.state = {profile1: "idle", profile2: "idle"}
+        self.consecutive_solo = {profile1: 0, profile2: 0}
+        # When a profile is stalled, we reject further relays from them
+        # until the stall clears. Stored as the time the stall expires.
+        self.stalled_until = {profile1: 0.0, profile2: 0.0}
+
+    def _other(self, name: str) -> str:
+        return self.profile2 if name == self.profile1 else self.profile1
+
+    def on_turn_record(self, speaker: str, text: str) -> list:
+        """Process a completed-turn record from `speaker`. Returns a list
+        of decisions for the relay_loop to execute, in order.
+        """
+        decisions = []
+        other = self._other(speaker)
+
+        # The other side replied (got a turn from `speaker` after `other`
+        # was last speaker, or vice versa) — clear `other`'s solo counter
+        # and any pending stall; bump `speaker`'s solo counter.
+        self.consecutive_solo[other] = 0
+        if self.stalled_until[other] > 0.0:
+            self.stalled_until[other] = 0.0
+        self.consecutive_solo[speaker] += 1
+
+        # If the speaker is currently stalled (cap previously hit and stall
+        # not yet cleared), drop the relay — we're waiting on the other
+        # side or the user's /resume.
+        if self.stalled_until[speaker] > 0.0:
+            now = time.monotonic()
+            if now < self.stalled_until[speaker]:
+                # Still stalled. Don't relay this turn.
+                return decisions
+            # Stall timeout elapsed — clear and continue.
+            self.stalled_until[speaker] = 0.0
+
+        # Always relay the speaker's text to the other pane.
+        decisions.append((self.RELAY, text, other))
+
+        # Backpressure trip: speaker just produced their Nth solo turn.
+        if self.consecutive_solo[speaker] >= self.cap:
+            sys_text = f"[SYSTEM] {other.upper()} hasn't replied yet — pausing."
+            self.stalled_until[speaker] = time.monotonic() + self.timeout
+            decisions.append((self.BACKPRESSURE, sys_text, speaker))
+
+        return decisions
+
+    def manual_resume(self, speaker: str | None = None) -> None:
+        """Operator-triggered /resume. Clears stall on `speaker` (or both
+        sides if None). Solo counters are NOT reset — the next genuine
+        turn from the other side does that organically.
+        """
+        targets = [speaker] if speaker else [self.profile1, self.profile2]
+        for p in targets:
+            if p in self.stalled_until:
+                self.stalled_until[p] = 0.0
+
+
+def _setup_turn_channel(profile_name: str) -> tuple[Path, str]:
+    """Create the per-profile turn-record channel (FIFO when supported,
+    JSONL fallback). Returns (path, channel_kind).
+
+    Detection rule: try mkfifo; on OSError (ENOTSUP, EPERM, etc.) fall
+    back to a writable JSONL path. The orchestrator logs the choice once
+    at startup so the operator knows which path is live.
+    """
+    fifo_path = ROOM_DIR / f"{profile_name}.fifo"
+    # Clear any stale node; a previous run's leftover would either be the
+    # right kind (re-create cleanly) or the wrong kind (replace).
+    try:
+        fifo_path.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        os.mkfifo(str(fifo_path), 0o600)
+        return fifo_path, "fifo"
+    except (OSError, NotImplementedError):
+        # Fall through to JSONL.
+        pass
+
+    jsonl_path = ROOM_DIR / f"{profile_name}.jsonl"
+    try:
+        jsonl_path.unlink()
+    except FileNotFoundError:
+        pass
+    jsonl_path.touch()
+    return jsonl_path, "jsonl"
+
+
 def relay_loop(profile1: str, profile2: str, topic: str = None,
-               prior_messages: list = None):
-    """Watch response files and relay between Claude panes.
+               prior_messages: list = None,
+               channels: dict | None = None):
+    """Drive the room: consume turn records from each proxy's channel,
+    feed them to a `TurnArbiter`, and execute its decisions (paste-buffer
+    relay, system backpressure messages, stalls).
+
+    `channels` is `{profile_name: (path, kind)}` where kind is "fifo" or
+    "jsonl". When None, we set up channels here as a courtesy (lets
+    standalone callers and tests use the same entry point).
 
     Pane layout after setup_tmux:
       0.0 = top-left (profile1 Claude)
@@ -392,19 +653,15 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
     room_id = f"{profile1}-{profile2}-{int(time.time())}"
     turn_seq = 0
 
-    # Response file paths
-    p1_file = ROOM_DIR / f"{profile1}_response.txt"
-    p2_file = ROOM_DIR / f"{profile2}_response.txt"
-
-    # Clean any stale response files
-    for f in [p1_file, p2_file]:
-        f.unlink(missing_ok=True)
-
-    # Track file modification times
-    mtimes = {
-        profile1: 0,
-        profile2: 0,
-    }
+    if channels is None:
+        # Late binding for callers that didn't pre-create channels. This
+        # path is only used by tests / non-room callers — the production
+        # `run_room` entry point pre-creates them so the proxy is told
+        # the path before it boots.
+        channels = {
+            profile1: _setup_turn_channel(profile1),
+            profile2: _setup_turn_channel(profile2),
+        }
 
     # Conversation log
     messages = prior_messages or []
@@ -414,19 +671,36 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
         profile1: f"room-{profile1}",
         profile2: f"room-{profile2}",
     }
-    files = {
-        profile1: p1_file,
-        profile2: p2_file,
-    }
     colors_map = {
         profile1: Y,
         profile2: C,
     }
 
+    # Per-profile channel readers. FIFO uses select; JSONL polls.
+    readers = {}
+    for name in (profile1, profile2):
+        ch_path, ch_kind = channels[name]
+        if ch_kind == "fifo":
+            readers[name] = _FifoReader(ch_path)
+        else:
+            readers[name] = _JsonlTailReader(ch_path)
+
+    # Arbiter — strict turn order + backpressure.
+    arbiter = TurnArbiter(profile1, profile2)
+
     # Give Claude sessions time to start up
     room_control.set_user(USER_NAME)
 
     with room_control.split_screen():
+        # One-time channel-mode banner so the operator sees which path is
+        # live (FIFO is always preferred; JSONL only on platforms where
+        # mkfifo failed). Useful for post-mortem on resume + audit logs.
+        for name in (profile1, profile2):
+            _, kind = channels[name]
+            room_control.render_transcript_line(
+                "ROOM", f"channel[{name}] = {kind}", DIM,
+            )
+
         room_control.render_transcript_line(
             "ROOM", f"waiting for Claude sessions to initialize...", DIM,
         )
@@ -443,7 +717,8 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
             })
             room_control.render_transcript_line(USER_NAME, topic, W)
 
-        # If resuming, send context to both panes
+        # If resuming, send context to both panes (kept as Phase 1 behavior;
+        # Phase 5 replaces this with a system-note inject regeneration).
         if prior_messages:
             context = "Previous conversation context:\\n"
             for msg in prior_messages[-10:]:  # Last 10 messages
@@ -457,25 +732,11 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
             "ROOM", "relay active — watching for responses (try /help)", DIM,
         )
 
-        # Turn tracking — who we expect to respond next
-        # None = accept from either side
-        expecting = profile1 if topic else None
-        last_speaker = None
-
-        # Phase 1 cockpit state
+        # Cockpit state
         paused = False
         end_after_turn = False
-        # `speaking` tracks profiles whose response file has changed but
-        # has not yet settled+relayed. While non-empty, user events are
-        # queued instead of dispatched immediately.
-        speaking: set = set()
-        # Quiet-tick counter — when no mtime changes are observed, we
-        # bump this; once it crosses a small threshold we flush queued
-        # user events even if `speaking` is empty (Phase 2 will swap
-        # this heuristic for a real stop_reason signal).
-        quiet_ticks = 0
 
-        # ─── inner helpers (close over panes/messages/etc.) ────────────
+        # ─── inner helpers (close over panes/messages/arbiter/etc.) ────
 
         def _say_to_both(text: str) -> None:
             """Relay event: log once, send to both panes once. Not typed
@@ -534,18 +795,12 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
             try:
                 subprocess.run(["less", "-R", str(tmp)])
             except Exception as e:
-                # Pager itself blew up; cockpit is already torn down. Try
-                # to bring it back so we can surface the error inline. If
-                # that fails too the next try/except below handles it.
                 sys.stderr.write(f"\nccoral: less failed: {e}\n")
                 sys.stderr.flush()
 
             try:
                 room_control.setup_split_screen()
             except Exception as e:
-                # Cockpit failed to re-arm. Terminal is bare; do NOT call
-                # render_transcript_line (it would no-op-ish to stdout).
-                # Save and exit cleanly after the in-flight turn.
                 sys.stderr.write(
                     f"\nccoral: cockpit re-entry failed: {e}\n"
                     f"ccoral: ending after in-flight turn — session will save.\n",
@@ -568,6 +823,9 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 room_control.render_transcript_line("ROOM", "paused", DIM)
             elif kind == "resume":
                 paused = False
+                # /resume also clears any arbiter stalls so the operator's
+                # explicit go-ahead beats backpressure timeouts.
+                arbiter.manual_resume()
                 room_control.render_transcript_line("ROOM", "resumed", DIM)
             elif kind == "end-after-turn":
                 end_after_turn = True
@@ -597,129 +855,157 @@ def relay_loop(profile1: str, profile2: str, topic: str = None,
                 )
             return True
 
+        def _handle_turn_record(speaker: str, record: dict) -> None:
+            """Log + render + arbiter-dispatch a completed-turn record."""
+            nonlocal turn_seq
+
+            text = (record.get("text") or "").strip()
+            if not text:
+                return
+
+            display = get_display_name(speaker)
+            color = colors_map[speaker]
+
+            # Log + render the turn into the cockpit transcript.
+            messages.append({
+                "name": display,
+                "text": text,
+                "time": datetime.now().isoformat(),
+                "stop_reason": record.get("stop_reason"),
+                "request_id": record.get("request_id"),
+            })
+            room_control.render_transcript_line(display, text, color)
+
+            if paused:
+                # Operator pause overrides arbiter; just transcribe.
+                return
+
+            # Hand to the arbiter and execute its decisions in order.
+            for decision in arbiter.on_turn_record(speaker, text):
+                kind = decision[0]
+                if kind == TurnArbiter.RELAY:
+                    _, relay_text, target = decision
+                    target_session = panes[target]
+                    turn_seq += 1
+                    buffer_name = f"ccoral-room-{room_id}-{turn_seq}"
+                    formatted = f"[{display}] {relay_text}"
+                    relay_via_paste_buffer(
+                        target_session, formatted, buffer_name,
+                    )
+                elif kind == TurnArbiter.BACKPRESSURE:
+                    _, sys_text, who = decision
+                    sys_session = panes[who]
+                    turn_seq += 1
+                    buffer_name = f"ccoral-room-{room_id}-{turn_seq}"
+                    relay_via_paste_buffer(
+                        sys_session, sys_text, buffer_name,
+                    )
+                    messages.append({
+                        "name": "SYSTEM",
+                        "text": sys_text,
+                        "time": datetime.now().isoformat(),
+                        "to": who,
+                    })
+                    room_control.render_transcript_line("SYSTEM", sys_text, DIM)
+
         # ───────────────────────────────────────────────────────────────
+
+        # Build the select fd list (FIFO readers only — JSONL is polled
+        # via the timeout tick).
+        select_fds = []
+        for name in (profile1, profile2):
+            r = readers[name]
+            fd = r.fileno()
+            if fd is not None:
+                select_fds.append(fd)
+        fd_to_name = {readers[n].fileno(): n for n in (profile1, profile2)
+                      if readers[n].fileno() is not None}
 
         try:
             while True:
                 # 1) Drain any input the user typed since last tick.
-                #    If a profile is currently mid-stream (or paused), the
-                #    event is queued and flushed later.
                 while True:
                     cmd = room_control.read_command(timeout=0)
                     if cmd is None:
                         break
-                    if cmd[0] in ("pause", "resume", "stop", "end-after-turn",
-                                  "save-now", "transcript", "help"):
-                        # Control commands always run immediately.
+                    cmd_kind = cmd[0]
+                    # Control commands always run immediately.
+                    if cmd_kind in ("pause", "resume", "stop",
+                                    "end-after-turn", "save-now",
+                                    "transcript", "help"):
                         if not _dispatch(cmd):
                             raise KeyboardInterrupt
-                    elif speaking or paused:
+                    elif cmd_kind == "inject":
+                        # `/to <p>` bypasses arbiter ordering and fires
+                        # immediately to the named pane only — explicit
+                        # operator override of turn discipline.
+                        if not _dispatch(cmd):
+                            raise KeyboardInterrupt
+                    elif paused:
                         room_control.enqueue_user_event(cmd)
                     else:
-                        if not _dispatch(cmd):
+                        # `/say` and other non-control: queue when a
+                        # speaker is mid-turn so we land cleanly at the
+                        # turn boundary; otherwise dispatch now.
+                        if cmd_kind == "say":
+                            room_control.enqueue_user_event(cmd)
+                        else:
+                            if not _dispatch(cmd):
+                                raise KeyboardInterrupt
+
+                # 2) Wait for FIFO bytes (or timeout).
+                if select_fds:
+                    try:
+                        ready, _, _ = select.select(
+                            select_fds, [], [], RELAY_SELECT_TIMEOUT,
+                        )
+                    except (InterruptedError, OSError) as e:
+                        # SIGWINCH from terminal resize wakes select with
+                        # EINTR on some libcs; not fatal.
+                        if isinstance(e, OSError) and e.errno != errno.EINTR:
+                            raise
+                        ready = []
+                else:
+                    # JSONL-only path: no fds to select on; sleep briefly.
+                    time.sleep(RELAY_SELECT_TIMEOUT)
+                    ready = []
+
+                # 3) Drain readable channels (FIFOs from select) +
+                #    poll any JSONL readers regardless.
+                turn_records = []
+                for name in (profile1, profile2):
+                    r = readers[name]
+                    fd = r.fileno()
+                    if fd is not None and fd not in ready:
+                        # FIFO wasn't readable — skip until next tick.
+                        continue
+                    for line in r.read_lines():
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        turn_records.append((name, rec))
+
+                # 4) Process each turn record through the arbiter.
+                for speaker, record in turn_records:
+                    _handle_turn_record(speaker, record)
+
+                # 5) After a tick that landed turns, flush any queued
+                #    user events at the turn boundary (Phase 1 contract).
+                if turn_records and not paused:
+                    for ev in room_control.drain_user_events():
+                        if not _dispatch(ev):
                             raise KeyboardInterrupt
 
-                time.sleep(POLL_INTERVAL)
-
-                # 2) Check response files for changes.
-                tick_observed_change = False
-                check_order = [profile1, profile2]
-                for name in check_order:
-                    fpath = files[name]
-                    if not fpath.exists():
-                        continue
-
-                    current_mtime = fpath.stat().st_mtime
-                    if current_mtime <= mtimes[name]:
-                        continue
-
-                    # File changed — mark this profile as speaking, wait
-                    # for the write to settle.
-                    tick_observed_change = True
-                    speaking.add(name)
-                    time.sleep(SETTLE_TIME)
-
-                    # Re-check mtime in case still writing
-                    if fpath.stat().st_mtime != current_mtime:
-                        continue  # Still changing, wait for next poll
-
-                    mtimes[name] = fpath.stat().st_mtime
-
-                    # Read the response
-                    try:
-                        response = fpath.read_text().strip()
-                    except Exception:
-                        continue
-
-                    if not response:
-                        speaking.discard(name)
-                        continue
-
-                    display = get_display_name(name)
-                    color = colors_map[name]
-
-                    # Log it
-                    messages.append({
-                        "name": display,
-                        "text": response,
-                        "time": datetime.now().isoformat(),
-                    })
-
-                    # Render to the cockpit transcript — full text, soft-wrapped.
-                    room_control.render_transcript_line(display, response, color)
-                    last_speaker = name
-
-                    # Relay to the OTHER session — gated by `paused`.
-                    # Phase 2: paste-buffer relay. Multi-line structure is
-                    # preserved verbatim; the previous "Read /tmp/..." leak
-                    # that put plumbing into the model's working memory is
-                    # gone. Format is the human-prefix the inject already
-                    # describes: `[<SPEAKER>] <text>`.
-                    if not paused:
-                        other = profile2 if name == profile1 else profile1
-                        other_session = panes[other]
-                        relay_text = f"[{display}] {response}"
-                        turn_seq += 1
-                        buffer_name = f"ccoral-room-{room_id}-{turn_seq}"
-                        relay_via_paste_buffer(
-                            other_session, relay_text, buffer_name,
-                        )
-
-                    # Clear the captured response file
-                    try:
-                        fpath.unlink()
-                    except Exception:
-                        pass
-
-                    # This profile finished its turn for relay purposes.
-                    speaking.discard(name)
-
-                    # 3) Flush queued user events — turn just landed.
-                    if not paused:
-                        for ev in room_control.drain_user_events():
-                            if not _dispatch(ev):
-                                raise KeyboardInterrupt
-
-                # 4) Quiet-tick handling — if nothing changed and the
-                #    queue is non-empty, flush after a short quiet window.
-                if not tick_observed_change:
-                    quiet_ticks += 1
-                    if (quiet_ticks >= 2 and not paused
-                            and room_control.queue_depth() > 0
-                            and not speaking):
-                        for ev in room_control.drain_user_events():
-                            if not _dispatch(ev):
-                                raise KeyboardInterrupt
-                        quiet_ticks = 0
-                else:
-                    quiet_ticks = 0
-
-                # 5) End-after-turn honored once nobody is mid-stream.
-                if end_after_turn and not speaking:
+                # 6) End-after-turn honored once a turn just landed.
+                if end_after_turn and turn_records:
                     break
 
         except KeyboardInterrupt:
             pass
+        finally:
+            for r in readers.values():
+                r.close()
 
     return messages
 
@@ -843,14 +1129,26 @@ def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None
     print(f"{DIM}Creating room profiles...{NC}")
     room_profiles = create_room_profiles(profile1, profile2)
 
+    # Phase 2: per-profile turn-record channel. Created BEFORE proxy launch
+    # so the FIFO node exists when the proxy first tries to open it for
+    # write. Falls back to JSONL on platforms where `mkfifo` fails.
+    channels = {
+        profile1: _setup_turn_channel(profile1),
+        profile2: _setup_turn_channel(profile2),
+    }
+    for name, (path, kind) in channels.items():
+        print(f"{DIM}Channel[{name}] = {kind} ({path}){NC}")
+
     print(f"{DIM}Starting proxies on :{BASE_PORT} and :{BASE_PORT + 1}...{NC}")
-    procs = start_proxies(room_profiles)
+    procs = start_proxies(room_profiles, channels=channels)
 
     print(f"{DIM}Setting up tmux session '{TMUX_SESSION}'...{NC}")
     setup_tmux(profile1, profile2)
 
     try:
-        messages = relay_loop(profile1, profile2, topic, prior_messages)
+        messages = relay_loop(
+            profile1, profile2, topic, prior_messages, channels=channels,
+        )
     finally:
         print(f"\n{DIM}Cleaning up...{NC}")
 
@@ -862,6 +1160,16 @@ def run_room(profile1: str, profile2: str, topic: str = None, resume: str = None
         # Stop proxies
         stop_proxies(procs)
         print(f"{DIM}Proxies stopped.{NC}")
+
+        # Remove channel nodes (FIFO/JSONL) so a stale node from a crashed
+        # run can't confuse the next launch.
+        for name, (path, _kind) in channels.items():
+            try:
+                Path(path).unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                print(f"{DIM}Channel cleanup ({name}): {e}{NC}")
 
         # Clean up temp profiles
         cleanup_room_profiles(profile1, profile2)

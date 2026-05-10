@@ -51,7 +51,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from textual import work
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.message import Message
@@ -137,6 +137,23 @@ class RoomLine(Message):
         self.record = record
 
 
+class RoomActivity(Message):
+    """A worker wrote a line to a non-active room. Tab label gains a
+    `+` badge until the operator focuses the tab (or hits Ctrl+L to
+    clear all badges).
+
+    Posted from the App's main thread inside the RoomLine handler —
+    the activity decision needs the active-tab state which only the
+    main thread can read consistently. Kept as a Message rather than
+    a direct mutation so the badge-update path is auditable in tests
+    via the same Pilot.pause() rhythm everywhere else uses.
+    """
+
+    def __init__(self, room_id: str) -> None:
+        super().__init__()
+        self.room_id = room_id
+
+
 # ---------------------------------------------------------------------------
 # RoomsCockpit — the App itself.
 # ---------------------------------------------------------------------------
@@ -203,6 +220,11 @@ class RoomsCockpit(App):
         # in C4 targets this when the operator types plain text without
         # a `/room <id>` prefix.
         self.last_active_room: "str | None" = None
+        # Per-room activity badge state. Set when a worker writes to a
+        # non-active tab; cleared when the operator focuses the tab or
+        # hits Ctrl+L. Public so tests can assert without scraping the
+        # tab label string.
+        self.activity_badges: set[str] = set()
 
     # ─── compose / lifecycle ───────────────────────────────────────────
 
@@ -449,6 +471,40 @@ class RoomsCockpit(App):
             unified_log = None
         if unified_log is not None:
             unified_log.write(unified)
+        # Activity badge — only fires when the room isn't the active
+        # tab. Posted as a Message so the badge mutation runs through
+        # the same dispatch path as everything else, keeping the test
+        # rhythm uniform (Pilot.pause() between act + assert).
+        if room_id != self._active_room_id():
+            self.post_message(RoomActivity(room_id))
+
+    def on_room_activity(self, message: RoomActivity) -> None:
+        """A worker reported activity on a non-active tab. Decorate the
+        tab label with a `+` badge if not already present.
+
+        Idempotent — a busy room writing dozens of lines per second
+        only ever decorates the label once until the badge is cleared.
+        """
+        room_id = message.room_id
+        if room_id in self.activity_badges:
+            return
+        self.activity_badges.add(room_id)
+        self._refresh_tab_label(room_id)
+
+    @on(TabbedContent.TabActivated)
+    def on_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        """Clear the activity badge for the tab the operator just
+        focused. Fires for every tab change — clicks, Ctrl+N/P, the
+        post-mount initial activation — so the badge contract is
+        "visible only while the operator is looking elsewhere".
+        """
+        try:
+            room_id = _room_id_from_pane(event.tab.id or "")
+        except Exception:
+            return
+        if room_id in self.activity_badges:
+            self.activity_badges.discard(room_id)
+            self._refresh_tab_label(room_id)
 
     # ─── mode + badge actions ──────────────────────────────────────────
 
@@ -460,19 +516,63 @@ class RoomsCockpit(App):
         self.unified_mode = not self.unified_mode
 
     def action_clear_badges(self) -> None:
-        """C3 lands the activity-badge clear. Stub here so the binding
-        is reachable from the first commit and the Footer label is
-        accurate.
+        """Ctrl+L — clear every activity badge. Useful after stepping
+        away from the cockpit and returning to a wall of `+` markers.
         """
-        return
+        if not self.activity_badges:
+            return
+        cleared = list(self.activity_badges)
+        self.activity_badges.clear()
+        for room_id in cleared:
+            self._refresh_tab_label(room_id)
 
     # ─── helpers ───────────────────────────────────────────────────────
 
     def _tab_label(self, room_id: str) -> str:
-        """Default tab label is the room id. C3 decorates with `+`
-        on activity, C5 decorates with `(stopped)` / `× broken`.
+        """Compose the visible tab label.
+
+        Format: ``<id> [+]`` when activity is pending. C5 will extend
+        this with ``(stopped)`` / ``× broken`` decorations.
         """
-        return room_id
+        suffix = " [+]" if room_id in self.activity_badges else ""
+        return f"{room_id}{suffix}"
+
+    def _refresh_tab_label(self, room_id: str) -> None:
+        """Re-render one tab's label after a badge state change.
+
+        Textual's ``TabPane`` exposes a ``label`` property that
+        accepts a string; assignment triggers a re-render. We resolve
+        the pane via the canonical ``_pane_id`` and silently no-op
+        when the pane isn't present (e.g. during teardown).
+        """
+        try:
+            pane = self.query_one(f"#{_pane_id(room_id)}", TabPane)
+        except Exception:
+            return
+        try:
+            pane.label = self._tab_label(room_id)
+        except Exception:
+            # Older Textual builds may expose the label through a
+            # different attribute. Falling back silently keeps the
+            # cockpit alive — the badge is a visual hint, not a
+            # correctness requirement.
+            pass
+
+    def _active_room_id(self) -> "str | None":
+        """Resolve the currently focused tab back to a room id.
+
+        Returns None when no TabbedContent exists yet (very early in
+        compose) or when the active tab is the empty-roster
+        placeholder.
+        """
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+        except Exception:
+            return None
+        active = tabs.active
+        if not active or active == "empty":
+            return None
+        return _room_id_from_pane(active)
 
 
 # ---------------------------------------------------------------------------
